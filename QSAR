@@ -1,0 +1,2403 @@
+library(shiny)
+library(shinythemes)
+library(DT)
+library(readxl)
+library(tidyverse)
+library(corrplot)
+library(pls)
+library(glmnet)
+library(prospectr)
+library(car)
+library(caret)
+library(ggpubr)
+library(randomForest)
+library(e1071)
+library(gbm)
+library(shinyjs)
+library(lmtest)
+library(colourpicker)
+library(xgboost)
+library(plotly)
+library(naniar)
+library(tidymodels)
+library(rmarkdown)
+library(ggcorrplot)
+library(ggthemes) # Added for theme_foundation()
+library(Ckmeans.1d.dp) # Required dependency
+
+
+# --- Helper Functions ---
+eval_results <- function(true, predicted, df) {
+  SSE <- sum((predicted - true)^2, na.rm = TRUE)
+  SST <- sum((true - mean(true, na.rm = TRUE))^2, na.rm = TRUE)
+  # FIX: Handle cases where SST is zero (e.g., only one sample in the test set)
+  # This prevents R-squared from becoming NaN, which would break the plot.
+  if (SST < .Machine$double.eps) {
+    R_square <- 0
+  } else {
+    R_square <- 1 - SSE / SST
+  }
+  RMSE <- sqrt(SSE / nrow(df))
+  return(data.frame(RMSE = RMSE, Rsquare = R_square))
+}
+
+# --- [IMPROVED & FIXED] Publication Quality ggplot Theme ---
+theme_publication <- function(base_size=14, base_family="") {
+  (theme_bw(base_size=base_size, base_family=base_family)
+   + theme(
+     plot.title = element_text(face = "bold", size = rel(1.2), hjust = 0.5, margin = ggplot2::margin(b=10)),
+     panel.background = element_rect(fill="white", colour = NA),
+     plot.background = element_rect(fill="white", colour = NA),
+     panel.border = element_rect(colour = "black", fill=NA, linewidth=1),
+     axis.title = element_text(face = "bold", size = rel(1)),
+     axis.title.y = element_text(angle=90, vjust = 2),
+     axis.title.x = element_text(vjust = -0.2),
+     axis.text = element_text(size = rel(0.9), colour = "black"),
+     axis.line = element_blank(), # Remove axis lines, rely on panel.border
+     axis.ticks = element_line(colour = "black"),
+     panel.grid.major = element_blank(), # Remove major grid lines
+     panel.grid.minor = element_blank(), # Remove minor grid lines
+     legend.key = element_rect(colour = NA, fill = NA),
+     legend.background = element_rect(colour = NA, fill = NA),
+     legend.position = "bottom",
+     legend.title = element_text(face="italic"),
+     plot.margin=unit(c(10,5,5,5),"mm"),
+     strip.background=element_rect(colour="black",fill="gray90"),
+     strip.text = element_text(face="bold")
+   ))
+}
+
+
+# --- [NEW & ENHANCED] Helper functions for generating insightful discussions ---
+generate_pub_discussion <- function(results) {
+  r2_train <- round(results$performance$Rsquare[1], 3)
+  r2_test <- round(results$performance$Rsquare[2], 3)
+  shapiro_p <- round(results$diagnostics$shapiro$p.value, 4)
+  bp_p <- round(results$diagnostics$bptest$p.value, 4)
+  
+  discussion <- paste(
+    "The final linear regression model demonstrated strong performance on the training data (R² =", r2_train,
+    ") and generalized well to the unseen test data (R² =", r2_test, ").",
+    "This indicates that the model is not overfit and can make reliable predictions on new data."
+  )
+  
+  if (abs(r2_train - r2_test) > 0.2) {
+    discussion <- paste(discussion, "However, the difference between training and test R² is notable, suggesting some degree of overfitting.")
+  }
+  
+  discussion <- paste(discussion, "<br><br><b>Model Diagnostics:</b>")
+  discussion <- paste(discussion, "The Shapiro-Wilk test for normality of residuals suggests that the residuals",
+                      if(shapiro_p < 0.05) "may not be normally distributed (p < 0.05), suggesting potential violations of model assumptions." else "are consistent with a normal distribution (p >= 0.05).")
+  discussion <- paste(discussion, "The Breusch-Pagan test indicates that the variance of the residuals",
+                      if(bp_p < 0.05) "may not be constant (p < 0.05), indicating heteroscedasticity." else "are consistent with the assumption of constant variance (homoscedasticity, p >= 0.05).")
+  
+  discussion <- paste(discussion, "These diagnostic results should be considered when interpreting the model's overall validity.")
+  return(HTML(discussion))
+}
+
+generate_pca_discussion <- function(pca_results) {
+  eigs <- pca_results$sdev^2
+  variance_explained <- round(100 * eigs / sum(eigs), 1)
+  pc1_var <- variance_explained[1]
+  pc2_var <- variance_explained[2]
+  
+  discussion <- paste(
+    "<b>Principal Component Analysis (PCA)</b> was performed to reduce the dimensionality of the dataset and identify underlying patterns.",
+    paste0("The <b>Scree Plot</b> shows the proportion of variance explained by each principal component. The first two components, PC1 and PC2, capture <b>", pc1_var, "%</b> and <b>", pc2_var, "%</b> of the total variance, respectively. Together, they account for <b>", pc1_var + pc2_var, "%</b> of the variability in the data, providing a good summary of the data structure in two dimensions."),
+    "<br><br>The <b>Scores Plot</b> visualizes the samples in the new PCA space. Samples that are close together in this plot are more similar to each other based on their original variables. Any visible clustering or separation of points can indicate distinct groups within the data.",
+    "The <b>Loadings Plot</b> shows how the original variables contribute to the principal components. Variables with high absolute loadings on a component are the most influential for that component. For example, variables far from the origin along the PC1 axis are the primary drivers of the variance captured by PC1."
+  )
+  return(HTML(discussion))
+}
+
+generate_xgb_discussion <- function(xgb_results) {
+  perf <- xgb_results$performance
+  r2_train <- round(perf$Rsquare[perf$DataSet == "Training"], 3)
+  r2_test <- round(perf$Rsquare[perf$DataSet == "Testing"], 3)
+  
+  discussion <- paste(
+    "An <b>Extreme Gradient Boosting (XGBoost)</b> model was trained to predict the response variable. XGBoost is a powerful ensemble algorithm known for its high performance.",
+    paste0("The model achieved an R-squared (R²) of <b>", r2_train, "</b> on the training set and <b>", r2_test, "</b> on the test set. The strong performance on the test set indicates that the model generalizes well to new, unseen data."),
+    "<br><br>The <b>Feature Importance</b> plot identifies the most influential predictors in the model. The variables at the top of this plot contributed the most to the model's predictive accuracy.",
+    "The <b>Training & Test Error</b> plot shows the model's Root Mean Square Error (RMSE) at each boosting iteration. Ideally, both the training and test error should decrease and then plateau. If the test error begins to increase while the training error continues to decrease, it is a sign of overfitting. The use of early stopping helps prevent this by halting training when test set performance no longer improves."
+  )
+  return(HTML(discussion))
+}
+
+generate_ad_discussion <- function(ad_results, h_star) {
+  outliers <- sum(ad_results$Status == "Outlier")
+  high_leverage <- sum(ad_results$Status == "High Leverage")
+  
+  discussion <- paste(
+    "The <b>Applicability Domain (AD)</b> was assessed using a Williams Plot to determine the reliability of the model's predictions.",
+    "This plot visualizes standardized residuals against leverage for each compound. The dashed red lines indicate the warning thresholds: a leverage cutoff (h* =", round(h_star, 3), ") and a standardized residual cutoff (±3).",
+    "<br><br><b>Interpretation:</b>",
+    "<ul>",
+    "<li><b>Compounds within the AD (green points):</b> These are considered reliable predictions.</li>",
+    "<li><b>High Leverage Compounds (blue points):</b> These are outliers in the predictor space (X-space). The model's predictions for them are extrapolations and should be treated with caution. There are <b>", high_leverage, "</b> such compounds.</li>",
+    "<li><b>Outliers (red points):</b> These compounds have large prediction errors (standardized residual > 3). The model failed to predict their activity accurately. There are <b>", outliers, "</b> such compounds.</li>",
+    "</ul>",
+    "A robust model should have the vast majority of its compounds within the AD."
+  )
+  return(HTML(discussion))
+}
+
+generate_ys_discussion <- function(ys_results) {
+  original_r2 <- round(ys_results$original_r2, 3)
+  scrambled_mean_r2 <- round(mean(ys_results$scrambled_r2), 3)
+  
+  discussion <- paste(
+    "<b>Y-Scrambling</b> was performed as a robust validation technique to check for chance correlations in the model.",
+    "The response variable was randomly shuffled multiple times, and a new model was built and evaluated for each shuffle.",
+    "<br><br>The histogram shows the distribution of R-squared values from the scrambled models. The vertical blue line represents the R-squared of the original, non-scrambled model (<b>R² = ", original_r2, "</b>).",
+    paste0("The average R² for the scrambled models was <b>", scrambled_mean_r2, "</b>. Since the original model's performance is significantly higher than that of the models built on random data, we can be confident that the model has captured a real relationship between the predictors and the response, rather than a spurious correlation.")
+  )
+  return(HTML(discussion))
+}
+
+generate_desc_discussion <- function(summary_stats, corr_matrix) {
+  num_vars <- nrow(summary_stats)
+  
+  # Find the pair with the highest absolute correlation
+  corr_matrix[lower.tri(corr_matrix, diag=TRUE)] <- NA
+  max_corr <- which(abs(corr_matrix) == max(abs(corr_matrix), na.rm=TRUE), arr.ind=TRUE)
+  var1 <- rownames(corr_matrix)[max_corr[1,1]]
+  var2 <- colnames(corr_matrix)[max_corr[1,2]]
+  corr_val <- round(corr_matrix[var1, var2], 3)
+  
+  discussion <- paste(
+    "The descriptive analysis provides a foundational understanding of the dataset's characteristics.",
+    paste0("The <b>Summary Statistics</b> table details the distribution of the <b>", num_vars, "</b> numeric variables, including measures of central tendency (mean, median) and spread (min, max, quartiles). This is useful for identifying potential skewness or outliers."),
+    "<br><br>The <b>Correlation Heatmap</b> visualizes the pairwise linear relationships between all variables. Red colors indicate a positive correlation, while blue colors indicate a negative correlation. The intensity of the color corresponds to the strength of the correlation.",
+    paste0("The strongest correlation observed was between <b>", var1, "</b> and <b>", var2, "</b>, with a Pearson coefficient of <b>", corr_val, "</b>. High correlations (typically > 0.85) between predictor variables can indicate multicollinearity, which may need to be addressed during modeling.")
+  )
+  return(HTML(discussion))
+}
+
+generate_mc_discussion <- function(mc_results) {
+  if (is.null(mc_results) || nrow(mc_results) == 0) {
+    return("Run the model comparison to generate a discussion.")
+  }
+  
+  best_model <- mc_results %>% filter(Test_R2 == max(Test_R2, na.rm=TRUE))
+  
+  discussion <- paste(
+    "The <b>Model Comparison</b> module trained and evaluated several regression algorithms to identify the best-performing model for this dataset.",
+    "Performance was primarily assessed using the R-squared (R²) on the held-out test set, which measures how well the model generalizes to new data.",
+    "<br><br>Based on the results, the <b>", best_model$Model, "</b> model performed the best, achieving a Test R² of <b>", round(best_model$Test_R2, 3), "</b>.",
+    "It's also important to consider the difference between training and test performance. A large gap may indicate overfitting. For the best model, the Training R² was <b>", round(best_model$Train_R2, 3), "</b>, suggesting it is a well-generalized model.",
+    "Simpler models like Linear Regression or LASSO may be preferred if interpretability is more important than achieving the absolute highest predictive accuracy."
+  )
+  return(HTML(discussion))
+}
+
+generate_loop_discussion <- function(loop_results) {
+  mean_test_r2 <- round(mean(loop_results$test.Rsquare, na.rm = TRUE), 3)
+  sd_test_r2 <- round(sd(loop_results$test.Rsquare, na.rm = TRUE), 3)
+  
+  discussion <- paste(
+    "The <b>Validation Loop</b> assesses the stability and robustness of the model formula by repeatedly splitting the data and refitting the model.",
+    "This process helps to understand how sensitive the model's performance is to different subsets of the data.",
+    "<br><br>The histograms show the distribution of R-squared values over all the iterations for both the training and test sets.",
+    paste0("The average R² on the test sets was <b>", mean_test_r2, "</b> with a standard deviation of <b>", sd_test_r2, "</b>. A tight distribution (low standard deviation) of the test set R² values indicates that the model is stable and its performance is not highly dependent on the specific data split, which increases confidence in its predictive power.")
+  )
+  return(HTML(discussion))
+}
+
+generate_tuning_discussion <- function(tune_results) {
+  best_tune <- tune_results$bestTune
+  
+  discussion <- paste(
+    "<b>Hyperparameter Tuning</b> was performed using cross-validation to find the optimal settings for the selected model, maximizing its predictive performance.",
+    "The plot shows how the model's performance (typically RMSE or R²) changes across different combinations of hyperparameters.",
+    "<br><br>The process identified the following best hyperparameters:",
+    "<ul>",
+    paste0("<li><b>", names(best_tune), ":</b> ", round(unlist(best_tune), 4), "</li>", collapse = ""),
+    "</ul>",
+    "Using these settings provides the best trade-off between bias and variance, leading to a model that is expected to generalize most effectively to new data."
+  )
+  return(HTML(discussion))
+}
+
+# --- 2. Define the User Interface (UI) ---
+ui <- fluidPage(
+  useShinyjs(),
+  tags$head(
+    # Custom CSS for a professional look and feel
+    tags$style(HTML("
+      @import url('https://fonts.googleapis.com/css2?family=Lato:wght@400;700&display=swap');
+      
+      body {
+        font-family: 'Lato', sans-serif;
+        background-color: #f8f9fa;
+      }
+      .navbar-default {
+        background-color: #ffffff;
+        border-bottom: 1px solid #dee2e6;
+      }
+      .navbar-default .navbar-brand {
+        color: #333;
+        font-weight: 700;
+        font-size: 24px;
+      }
+      .sidebar {
+        background-color: #ffffff;
+        border-right: 1px solid #dee2e6;
+        padding: 20px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+      }
+      .well {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        box-shadow: none;
+      }
+      .btn-primary {
+        background-color: #007bff;
+        border-color: #007bff;
+        transition: background-color 0.2s;
+      }
+      .btn-primary:hover {
+        background-color: #0056b3;
+        border-color: #0056b3;
+      }
+      .nav-tabs > li > a {
+        color: #333;
+      }
+      .nav-tabs > li.active > a, .nav-tabs > li.active > a:hover, .nav-tabs > li.active > a:focus {
+        background-color: #f8f9fa;
+        border-bottom-color: transparent;
+      }
+      h4 {
+        font-weight: 700;
+        color: #333;
+      }
+    "))
+  ),
+  
+  navbarPage(
+    "Comprehensive Analysis Tool",
+    
+    # --- Home Tab ---
+    tabPanel("Home",
+             fluidPage(
+               titlePanel("Welcome to the Comprehensive Analysis Tool"),
+               p("This application provides a complete, interactive environment for statistical analysis and QSAR modeling. Navigate through the tabs to perform your analysis."),
+               hr(),
+               h4("Workflow Overview"),
+               tags$ol(
+                 tags$li(tags$b("Data Explorer:"), "Upload your dataset to begin."),
+                 tags$li(tags$b("Data Preprocessing:"), "Handle missing values and transform data."),
+                 tags$li(tags$b("Descriptive Analysis:"), "Get summary statistics and visualize correlations."),
+                 tags$li(tags$b("Dimensionality Reduction:"), "Use PCA and clustering to explore data structure."),
+                 tags$li(tags$b("Modeling:"), "Choose from multiple tabs to build, validate, and compare regression models."),
+                 tags$li(tags$b("Help & Documentation:"), "Refer to the 'Protocols & Methods' tab for detailed explanations.")
+               ),
+               hr(),
+               uiOutput("data_guidance_ui")
+             )
+    ),
+    
+    # --- Data Explorer Tab ---
+    tabPanel("Data Explorer",
+             sidebarLayout(
+               sidebarPanel(
+                 class = "sidebar",
+                 fileInput("file1", "Choose CSV or Excel File",
+                           multiple = FALSE,
+                           accept = c("text/csv",
+                                      "text/comma-separated-values,text/plain",
+                                      ".csv",
+                                      ".xlsx",
+                                      ".xls")),
+                 hr(),
+                 tags$p("Upload your dataset to begin the analysis. The table on the right will display the contents of your file."),
+                 width = 3
+               ),
+               mainPanel(
+                 DTOutput("contents")
+               )
+             )
+    ),
+    
+    # --- Data Preprocessing Tab ---
+    tabPanel("Data Preprocessing",
+             sidebarLayout(
+               sidebarPanel(
+                 class = "sidebar",
+                 h4("Data Cleaning & Transformation"),
+                 p("Handle missing data and apply transformations. The processed data will be available for all subsequent analysis tabs."),
+                 hr(),
+                 wellPanel(
+                   h5("Missing Value Handling"),
+                   selectInput("imputation_method", "Imputation Method:",
+                               choices = c("None",
+                                           "Mean" = "meanImpute",
+                                           "Median" = "medianImpute",
+                                           "k-Nearest Neighbors (k-NN)" = "knnImpute"))
+                 ),
+                 wellPanel(
+                   h5("Data Transformation"),
+                   uiOutput("transform_var_selector"),
+                   selectInput("transform_method", "Transformation Method:",
+                               choices = c("None", "Log", "Square Root", "Box-Cox"))
+                 ),
+                 hr(),
+                 actionButton("preprocess_data", "Apply Preprocessing", class = "btn-primary"),
+                 width = 3
+               ),
+               mainPanel(
+                 h4("Missing Data Visualization"),
+                 plotOutput("missing_data_plot"),
+                 hr(),
+                 h4("Data Preview (after preprocessing)"),
+                 DTOutput("preprocessed_data_preview")
+               )
+             )
+    ),
+    
+    # --- Descriptive Analysis Tab ---
+    tabPanel("Descriptive Analysis",
+             sidebarLayout(
+               sidebarPanel(
+                 class = "sidebar",
+                 h4("Analysis Options"),
+                 actionButton("run_desc_stats", "Calculate Summary Stats"),
+                 hr(),
+                 selectInput("corrplot_method", "Heatmap Style:",
+                             choices = c("Color Squares" = "color",
+                                         "Circles" = "circle",
+                                         "Numbers" = "number"),
+                             selected = "color"),
+                 actionButton("run_corrplot", "Generate Correlation Heatmap"),
+                 width = 3
+               ),
+               mainPanel(
+                 h4("Summary Statistics"),
+                 DTOutput("summary_stats_table"),
+                 hr(),
+                 h4("Correlation Heatmap"),
+                 plotOutput("corr_heatmap"),
+                 hr(),
+                 uiOutput("desc_discussion_ui") # Discussion UI
+               )
+             )
+    ),
+    
+    # --- Dimensionality Reduction & Clustering Tab ---
+    tabPanel("Dimensionality Reduction & Clustering",
+             sidebarLayout(
+               sidebarPanel(
+                 class = "sidebar",
+                 h4("Analysis Options"),
+                 actionButton("run_pca", "Run PCA"),
+                 hr(),
+                 wellPanel(
+                   h4("Clustering"),
+                   sliderInput("kmeans_clusters", "Number of K-Means Clusters:", min = 2, max = 10, value = 3),
+                   actionButton("run_kmeans", "Run K-Means"),
+                   hr(),
+                   actionButton("run_hclust", "Run Hierarchical Clustering")
+                 ),
+                 hr(),
+                 wellPanel(
+                   h4("Kennard-Stone Selection (on PCA Scores)"),
+                   numericInput("ks_select_n", "Number of Samples to Select:", 10, min = 2, max = 100),
+                   actionButton("run_ks_on_pca", "Run Kennard-Stone Selection")
+                 ),
+                 width = 3
+               ),
+               mainPanel(
+                 tabsetPanel(
+                   tabPanel("PCA Scores", plotlyOutput("pca_scores_plot")),
+                   tabPanel("PCA Loadings", plotlyOutput("pca_loadings_plot")),
+                   tabPanel("Scree Plot", plotOutput("scree_plot")),
+                   tabPanel("Dendrogram", plotOutput("dendrogram_plot"))
+                 ),
+                 hr(),
+                 uiOutput("pca_discussion_ui") # Discussion UI
+               )
+             )
+    ),
+    
+    # --- Modeling Menu ---
+    navbarMenu("Modeling",
+               # --- Automated MLR Tab ---
+               tabPanel("Automated MLR",
+                        sidebarLayout(
+                          sidebarPanel(
+                            class = "sidebar",
+                            h4("Automated Feature Selection for MLR"),
+                            p("This module performs a rigorous, multi-step feature selection process to build a robust Multiple Linear Regression model."),
+                            hr(),
+                            uiOutput("mlr_response_selector"),
+                            hr(),
+                            h5("Feature Selection Thresholds"),
+                            sliderInput("corr_threshold", "Correlation with Response Cutoff:", min = 0.1, max = 0.9, value = 0.3, step = 0.1),
+                            sliderInput("predictor_corr_cutoff", "Inter-Predictor Correlation Cutoff:", min = 0.7, max = 1.0, value = 0.85, step = 0.05),
+                            numericInput("vif_threshold", "VIF Threshold:", value = 4, min = 2, max = 20),
+                            hr(),
+                            actionButton("run_auto_mlr", "Run Automated MLR", class = "btn-primary"),
+                            hr(),
+                            downloadButton("download_selected_data", "Download Selected Data"),
+                            width = 3
+                          ),
+                          mainPanel(
+                            tabsetPanel(
+                              tabPanel("Log", verbatimTextOutput("mlr_log")),
+                              tabPanel("Model Summary", verbatimTextOutput("mlr_summary")),
+                              tabPanel("Model Equation", verbatimTextOutput("mlr_equation")),
+                              tabPanel("Plots",
+                                       fluidRow(
+                                         column(6, plotlyOutput("mlr_actual_vs_pred")),
+                                         column(6, plotlyOutput("mlr_residuals_plot"))
+                                       ),
+                                       hr(),
+                                       fluidRow(
+                                         column(6, plotlyOutput("mlr_var_importance")),
+                                         column(6, plotOutput("mlr_response_hist"))
+                                       ),
+                                       hr(),
+                                       h4("Predictor Scatter Plots"),
+                                       uiOutput("mlr_scatter_plots_ui")
+                              )
+                            )
+                          )
+                        )
+               ),
+               
+               # --- Hyperparameter Tuning Tab ---
+               tabPanel("Hyperparameter Tuning",
+                        sidebarLayout(
+                          sidebarPanel(
+                            class = "sidebar",
+                            h4("Automated Model Tuning"),
+                            p("Use cross-validation to find the best hyperparameters for a model."),
+                            uiOutput("tune_response_selector"),
+                            selectInput("tune_model_type", "Select Model:",
+                                        choices = c("Random Forest", "XGBoost", "SVM")),
+                            hr(),
+                            h5("Tuning Setup"),
+                            sliderInput("tune_cv_folds", "Cross-Validation Folds:", min = 3, max = 10, value = 5),
+                            numericInput("tune_grid_size", "Tuning Grid Size:", 10, min = 2, max = 20),
+                            hr(),
+                            actionButton("run_tuning", "Run Hyperparameter Tuning", class = "btn-primary"),
+                            width = 3
+                          ),
+                          mainPanel(
+                            h4("Tuning Results"),
+                            plotOutput("tuning_plot"),
+                            hr(),
+                            h4("Best Hyperparameters"),
+                            verbatimTextOutput("best_params"),
+                            hr(),
+                            uiOutput("tuning_discussion_ui") # Discussion UI
+                          )
+                        )
+               ),
+               
+               # --- Publication Analysis Tab ---
+               tabPanel("Publication Analysis",
+                        sidebarLayout(
+                          sidebarPanel(
+                            class = "sidebar",
+                            h4("Analysis Setup"),
+                            p("This module runs a complete, reproducible analysis pipeline with advanced diagnostics, suitable for publication."),
+                            uiOutput("pub_response_selector"),
+                            sliderInput("pub_split_ratio", "Training Set Ratio:", min = 0.5, max = 0.9, value = 0.75, step = 0.05),
+                            numericInput("pub_seed", "Random Seed:", 123),
+                            hr(),
+                            h4("Plot Customization"),
+                            textInput("pub_avp_title", "Actual vs. Predicted Title:", "Actual vs. Predicted Values"),
+                            textInput("pub_imp_title", "Importance Plot Title:", "Variable Importance"),
+                            sliderInput("pub_base_font_size", "Base Font Size:", min = 8, max = 24, value = 14),
+                            sliderInput("pub_point_size", "Point Size:", min = 1, max = 10, value = 3),
+                            colourInput("pub_train_color", "Training Set Color:", "blue"),
+                            colourInput("pub_test_color", "Test Set Color:", "red"),
+                            hr(),
+                            actionButton("run_pub_analysis", "Run Publication Analysis", class = "btn-primary"),
+                            hr(),
+                            downloadButton("download_pub_log", "Download Analysis Log"),
+                            downloadButton("download_pub_final_data", "Download Final Data"),
+                            downloadButton("download_pub_plots", "Download Plots"),
+                            downloadButton("download_report", "Download HTML Report"),
+                            width = 3
+                          ),
+                          mainPanel(
+                            h4("Analysis Log"),
+                            verbatimTextOutput("pub_log"),
+                            hr(),
+                            h4("Performance Summary"),
+                            DTOutput("pub_performance_table"),
+                            hr(),
+                            h4("Final Model Equation"),
+                            verbatimTextOutput("pub_model_equation"),
+                            hr(),
+                            h4("Discussion of Results"),
+                            wellPanel(uiOutput("pub_discussion")),
+                            hr(),
+                            uiOutput("next_step_ui"),
+                            hr(),
+                            h4("Publication-Ready Plots"),
+                            fluidRow(
+                              column(6, plotlyOutput("pub_actual_vs_pred_plot")),
+                              column(6, plotlyOutput("pub_var_imp_plot"))
+                            ),
+                            fluidRow(
+                              column(6, plotlyOutput("pub_split_pca_plot")),
+                              column(6, plotOutput("pub_selected_corr_plot"))
+                            ),
+                            hr(),
+                            h4("Diagnostic Plots"),
+                            plotOutput("pub_diagnostic_plots")
+                          )
+                        )
+               ),
+               
+               # --- XGBoost Analysis Tab ---
+               tabPanel("XGBoost Analysis",
+                        sidebarLayout(
+                          sidebarPanel(
+                            class = "sidebar",
+                            h4("XGBoost Model Setup"),
+                            uiOutput("xgb_response_selector"),
+                            sliderInput("xgb_split_ratio", "Training Set Ratio:", min = 0.5, max = 0.9, value = 0.75, step = 0.05),
+                            hr(),
+                            h5("Hyperparameters"),
+                            numericInput("xgb_nrounds", "Number of Rounds:", 100, min = 10, max = 1000),
+                            sliderInput("xgb_max_depth", "Max Tree Depth:", min = 1, max = 10, value = 6),
+                            sliderInput("xgb_eta", "Learning Rate (eta):", min = 0.01, max = 0.3, value = 0.1),
+                            hr(),
+                            actionButton("run_xgb", "Train XGBoost Model", class = "btn-primary"),
+                            width = 3
+                          ),
+                          mainPanel(
+                            h4("Model Performance"),
+                            verbatimTextOutput("xgb_performance"),
+                            hr(),
+                            fluidRow(
+                              column(6, plotlyOutput("xgb_actual_vs_pred_plot")),
+                              column(6, plotlyOutput("xgb_var_imp_plot"))
+                            ),
+                            hr(),
+                            plotlyOutput("xgb_error_plot"),
+                            hr(),
+                            uiOutput("xgb_discussion_ui") # Discussion UI
+                          )
+                        )
+               ),
+               
+               # --- [IMPROVED] Model Comparison Tab ---
+               tabPanel("Model Comparison",
+                        sidebarLayout(
+                          sidebarPanel(
+                            class = "sidebar",
+                            h4("Model Comparison Setup"),
+                            uiOutput("mc_response_selector"),
+                            sliderInput("mc_train_size", "Number of Training Samples:", min = 5, max = 100, value = 20),
+                            hr(),
+                            checkboxGroupInput("mc_models_to_run", "Select Models to Compare:",
+                                               choices = c("Linear Regression", "LASSO", "Ridge", "Elastic Net",
+                                                           "Random Forest", "SVM", "GBM", "Stepwise Regression"),
+                                               selected = c("Linear Regression", "LASSO", "Random Forest")),
+                            hr(),
+                            actionButton("run_model_comparison", "Run Model Comparison", class = "btn-primary"),
+                            hr(),
+                            downloadButton("download_mc_results", "Download Results"),
+                            width = 3
+                          ),
+                          mainPanel(
+                            h4("Model Performance Comparison"),
+                            DTOutput("mc_results_table"),
+                            hr(),
+                            h4("Performance Visualization"),
+                            plotOutput("mc_results_plot", height = "600px"), # Increased height for better visibility
+                            hr(),
+                            uiOutput("mc_discussion_ui"), # Discussion UI
+                            hr(),
+                            h4("Analysis Log"),
+                            verbatimTextOutput("mc_log")
+                          )
+                        )
+               )
+    ),
+    
+    # --- Analysis Dashboard Tab ---
+    tabPanel("Analysis Dashboard",
+             sidebarLayout(
+               sidebarPanel(
+                 class = "sidebar",
+                 h4("Analysis Dashboard"),
+                 p("This module provides a consolidated view of all key plots from the 'Publication Analysis' tab. You must run that analysis first."),
+                 actionButton("run_dashboard", "Generate Dashboard", class = "btn-primary"),
+                 hr(),
+                 downloadButton("download_dashboard", "Download Dashboard Plot"),
+                 width = 3
+               ),
+               mainPanel(
+                 plotOutput("dashboard_plot", height = "1200px")
+               )
+             )
+    ),
+    
+    # --- Advanced Validation Menu ---
+    navbarMenu("Advanced Validation",
+               # --- Applicability Domain Tab ---
+               tabPanel("Applicability Domain",
+                        sidebarLayout(
+                          sidebarPanel(
+                            class = "sidebar",
+                            h4("Applicability Domain (AD) Analysis"),
+                            p("This module uses the model from the 'Publication Analysis' tab to assess its reliability using the leverage approach (Williams Plot). You must run the Publication Analysis first."),
+                            actionButton("run_ad_analysis", "Run AD Analysis", class = "btn-primary"),
+                            width = 3
+                          ),
+                          mainPanel(
+                            h4("Williams Plot"),
+                            plotlyOutput("williams_plot"),
+                            hr(),
+                            h4("Compounds Outside AD"),
+                            DTOutput("ad_outliers_table"),
+                            hr(),
+                            uiOutput("ad_discussion_ui") # Discussion UI
+                          )
+                        )
+               ),
+               # --- Y-Scrambling Tab ---
+               tabPanel("Y-Scrambling",
+                        sidebarLayout(
+                          sidebarPanel(
+                            class = "sidebar",
+                            h4("Y-Scrambling Validation"),
+                            p("This module uses the model and data from 'Publication Analysis' to check for chance correlations. You must run the Publication Analysis first."),
+                            numericInput("scramble_iterations", "Number of Scrambles:", 100, min=10, max=500),
+                            hr(),
+                            actionButton("run_y_scrambling", "Run Y-Scrambling", class = "btn-primary"),
+                            width = 3
+                          ),
+                          mainPanel(
+                            h4("Y-Scrambling Results"),
+                            plotOutput("y_scrambling_plot"),
+                            hr(),
+                            h4("Summary Statistics"),
+                            verbatimTextOutput("y_scrambling_summary"),
+                            hr(),
+                            uiOutput("ys_discussion_ui") # Discussion UI
+                          )
+                        )
+               ),
+               # --- Validation Loop Tab ---
+               tabPanel("Validation Loop",
+                        sidebarLayout(
+                          sidebarPanel(
+                            class = "sidebar",
+                            h4("Iterative Model Validation"),
+                            p("This module repeatedly splits the data from the 'Publication Analysis' tab to test the stability of the final model formula. You must run the Publication Analysis first."),
+                            numericInput("loop_iterations", "Number of Iterations:", 100, min = 10, max = 500),
+                            sliderInput("loop_test_size", "Number of Test Samples:", min = 5, max = 50, value = 12),
+                            hr(),
+                            actionButton("run_validation_loop", "Run Validation Loop", class = "btn-primary"),
+                            width = 3
+                          ),
+                          mainPanel(
+                            h4("Validation Results"),
+                            fluidRow(
+                              column(6, plotOutput("loop_test_r2_plot")),
+                              column(6, plotOutput("loop_train_r2_plot"))
+                            ),
+                            hr(),
+                            h4("Summary of R-squared Values"),
+                            verbatimTextOutput("loop_summary"),
+                            hr(),
+                            uiOutput("loop_discussion_ui") # Discussion UI
+                          )
+                        )
+               )
+    ),
+    
+    # --- [NEW] Final Report Tab ---
+    tabPanel("Final Report",
+             sidebarLayout(
+               sidebarPanel(
+                 class = "sidebar",
+                 h4("Generate Final Report"),
+                 p("This module compiles a summary of all analyses performed in this session into a single report draft."),
+                 actionButton("generate_final_report", "Generate Report", class = "btn-primary"),
+                 hr(),
+                 downloadButton("download_final_report", "Download Report as .txt"),
+                 width = 3
+               ),
+               mainPanel(
+                 h4("Comprehensive Analysis Summary"),
+                 verbatimTextOutput("final_report_output")
+               )
+             )
+    ),
+    
+    # --- Protocols & Methods Tab ---
+    tabPanel("Protocols & Methods",
+             mainPanel(
+               width = 12,
+               h2("Protocols and Methodologies"),
+               p("This section provides a detailed explanation of the statistical methods, algorithms, and validation techniques used throughout this application."),
+               hr(),
+               tabsetPanel(
+                 tabPanel("Feature Selection",
+                          h4("Automated Feature Selection Protocol"),
+                          p("The automated feature selection process (used in the 'Automated MLR' and 'Publication Analysis' tabs) is a rigorous, multi-step pipeline designed to identify a robust and non-redundant set of predictor variables. This process is crucial for building stable and interpretable linear models."),
+                          tags$ol(
+                            tags$li(tags$b("Correlation with Response:"), "Initially, all numeric predictors are evaluated based on their Pearson correlation with the selected response variable. Only predictors with an absolute correlation coefficient greater than a specified threshold (e.g., 0.3) are retained. This step ensures that only variables with at least a moderate linear relationship to the response are considered for the model."),
+                            tags$li(tags$b("Alias Removal (Perfect Collinearity):"), "The app checks for perfect multicollinearity, where one predictor is a perfect linear combination of others. Such variables (aliased coefficients) provide no new information and make the model matrix non-invertible. The app identifies and removes these variables to ensure model stability."),
+                            tags$li(tags$b("Inter-Correlation of Predictors:"), "To reduce redundancy, the Pearson correlation matrix of the remaining predictors is calculated. The app uses the `findCorrelation` function from the `caret` package to identify and remove the minimum number of variables necessary to ensure that no pair of predictors has an absolute correlation above a high cutoff (e.g., 0.85)."),
+                            tags$li(tags$b("Variance Inflation Factor (VIF) Filtering:"), "Finally, the app iteratively checks for multicollinearity among groups of predictors using the Variance Inflation Factor (VIF). A VIF value for a predictor quantifies how much the variance of its estimated coefficient is inflated due to its correlation with other predictors. In each iteration, the variable with the highest VIF is removed, and the process is repeated until all remaining variables have a VIF below a specified threshold (e.g., 4). This ensures the final model's coefficients are stable and interpretable.")
+                          )
+                 ),
+                 tabPanel("Modeling Algorithms",
+                          h4("Regression Models"),
+                          tags$b("Multiple Linear Regression (MLR):"), p("The standard regression model that assumes a linear relationship between the predictors and the response variable."),
+                          tags$b("Partial Least Squares (PLS):"), p("A dimensionality reduction technique similar to PCA, but it also considers the response variable when creating components. It is highly effective for datasets with many, highly collinear predictors (p > n)."),
+                          tags$b("Lasso Regression:"), p("A regularized regression method that performs both variable selection and regularization by shrinking some coefficients to exactly zero. It is useful for creating simpler, more interpretable models."),
+                          tags$b("Ridge Regression:"), p("Another regularized method that shrinks coefficients towards zero but does not set them exactly to zero. It is effective at handling multicollinearity."),
+                          tags$b("Elastic Net:"), p("A hybrid of Lasso and Ridge regression, combining their strengths. It can select groups of correlated variables."),
+                          tags$b("Random Forest:"), p("An ensemble method that builds multiple decision trees and merges their outputs. It is robust to overfitting and can capture complex non-linear relationships."),
+                          tags$b("Support Vector Machine (SVM):"), p("A powerful machine learning model that finds an optimal hyperplane to separate data points. For regression, it finds a hyperplane that best fits the data within a certain error margin."),
+                          tags$b("Gradient Boosting Machine (GBM):"), p("An ensemble method that builds models sequentially, where each new model corrects the errors of the previous one. It is often one of the highest-performing machine learning algorithms."),
+                          tags$b("XGBoost:"), p("Extreme Gradient Boosting is an advanced, optimized implementation of GBM. It is known for its high performance, speed, and efficiency, often leading to state-of-the-art results in competitions and real-world applications.")
+                 ),
+                 tabPanel("Model Validation",
+                          h4("Data Splitting and Validation Techniques"),
+                          tags$b("Kennard-Stone Algorithm:"), p("A deterministic algorithm used to split data into training and test sets. It ensures that the training set uniformly covers the entire descriptor space by selecting points sequentially based on their distance from already selected points. This often leads to more robust models compared to random splitting, as it guarantees the test set contains points that are interpolated by, rather than extrapolated from, the training set."),
+                          tags$b("Applicability Domain (AD):"), p("The AD defines the chemical space in which the QSAR model is expected to make reliable predictions. This app uses the leverage approach, visualized with a Williams Plot. The plot shows standardized residuals versus leverage (hat values) for each compound. Points with high leverage may be influential outliers in the descriptor space, while points with high residuals are poorly predicted by the model. The 'warning leverage' (h*) is a threshold beyond which predictions are considered extrapolations and may be unreliable."),
+                          tags$b("Y-Scrambling:"), p("A crucial validation technique to test for chance correlations. The response variable (Y-vector) is randomly shuffled multiple times, and a new QSAR model is built for each shuffled vector. The performance of these 'scrambled' models is compared to the performance of the original model. A valid model should have significantly better performance (e.g., higher R²) than any of the models built on random data. If scrambled models perform similarly to the original, it suggests the original model's performance may be due to a spurious correlation."),
+                          tags$b("Iterative Validation Loop:"), p("This method assesses the stability and robustness of a specific model formula by repeatedly performing random train/test splits. By running many iterations (e.g., 100), it generates distributions of the training and testing R-squared values. A robust model will show consistent performance across different splits, with a tight distribution of test set R² values.")
+                 )
+               )
+             )
+    )
+  )
+)
+
+
+# --- 3. Define the Server Logic ---
+server <- function(input, output, session) {
+  
+  # --- Reactive Values for Data Storage (Consolidated) ---
+  data_rv <- reactiveValues(
+    raw = NULL,
+    numeric = NULL,
+    processed = NULL, # For preprocessed data
+    pca_results = NULL,
+    qsar_model = NULL,
+    mlr_results = NULL,
+    mc_results = NULL,
+    report_results = NULL,
+    loop_results = NULL,
+    pub_results = NULL,
+    ad_results = NULL,
+    ys_results = NULL,
+    dashboard_plot = NULL,
+    xgb_results = NULL,
+    tune_results = NULL,
+    summary_stats = NULL, # For desc discussion
+    corr_matrix = NULL,   # For desc discussion
+    final_report_text = NULL # For final report
+  )
+  
+  # Using shiny::observe to prevent package conflicts
+  shiny::observe({
+    shinyjs::disable("validate_model")
+  })
+  
+  # --- File Upload Logic ---
+  shiny::observeEvent(input$file1, {
+    req(input$file1)
+    
+    tryCatch({
+      df <- if (endsWith(input$file1$name, ".csv")) {
+        read.csv(input$file1$datapath)
+      } else {
+        readxl::read_excel(input$file1$datapath)
+      }
+      
+      data_rv$raw <- df
+      data_rv$numeric <- df %>% dplyr::select_if(is.numeric)
+      # Initialize processed data with the numeric columns
+      data_rv$processed <- data_rv$numeric
+      
+      showNotification("File uploaded and processed successfully!", type = "message")
+      
+    }, error = function(e) {
+      showNotification(paste("Error reading file:", e$message), type = "error")
+    })
+  })
+  
+  output$contents <- renderDT({
+    req(data_rv$raw)
+    datatable(data_rv$raw, options = list(scrollX = TRUE, pageLength = 10))
+  })
+  
+  # --- Decision Module Logic ---
+  output$data_guidance_ui <- renderUI({
+    req(data_rv$raw)
+    
+    n_rows <- nrow(data_rv$raw)
+    
+    if (n_rows < 100) {
+      wellPanel(
+        h4("Analysis Guidance: Small Dataset"),
+        p(paste("Your dataset has", n_rows, "rows. For smaller datasets, it's often best to start with simpler, more interpretable models to avoid overfitting.")),
+        tags$ul(
+          tags$li("We recommend starting with the ", tags$b("Automated MLR"), " or ", tags$b("Publication Analysis"), " tabs."),
+          tags$li("The ", tags$b("Model Comparison"), " tab can be useful to see how different models perform, but be cautious with complex models like XGBoost.")
+        )
+      )
+    } else {
+      wellPanel(
+        h4("Analysis Guidance: Large Dataset"),
+        p(paste("Your dataset has", n_rows, "rows. With a larger dataset, you can confidently explore more complex models.")),
+        tags$ul(
+          tags$li("All modeling tabs are suitable for your dataset size."),
+          tags$li("Consider using the ", tags$b("XGBoost Analysis"), " and ", tags$b("Hyperparameter Tuning"), " tabs to potentially build a high-performance model.")
+        )
+      )
+    }
+  })
+  
+  # --- Observer for Dynamic UI Elements ---
+  shiny::observe({
+    req(data_rv$numeric)
+    
+    # Update sliders that depend on data size
+    max_train <- nrow(data_rv$numeric) - 5
+    max_test <- round(nrow(data_rv$numeric) / 2) - 1
+    updateSliderInput(session, "mc_train_size", max = max_train)
+    updateSliderInput(session, "loop_test_size", max = max_test)
+    
+    # Render all UI selectors that depend on column names
+    output$transform_var_selector <- renderUI({
+      selectInput("transform_var", "Variable to Transform:", choices = names(data_rv$numeric))
+    })
+    output$mlr_response_selector <- renderUI({
+      selectInput("mlr_response_var", "Select Response Variable:", choices = names(data_rv$numeric), selected = names(data_rv$numeric)[1])
+    })
+    output$pub_response_selector <- renderUI({
+      selectInput("pub_response_var", "Select Response Variable:", choices = names(data_rv$numeric), selected = names(data_rv$numeric)[1])
+    })
+    output$xgb_response_selector <- renderUI({
+      selectInput("xgb_response_var", "Select Response Variable:", choices = names(data_rv$numeric), selected = names(data_rv$numeric)[1])
+    })
+    output$tune_response_selector <- renderUI({
+      selectInput("tune_response_var", "Select Response Variable:", choices = names(data_rv$numeric), selected = names(data_rv$numeric)[1])
+    })
+    output$mc_response_selector <- renderUI({
+      selectInput("mc_response_var", "Select Response Variable:", choices = names(data_rv$numeric), selected = names(data_rv$numeric)[1])
+    })
+    output$activity_var_selector <- renderUI({
+      selectInput("activity_var", "Select Activity Variable (Y):", choices = names(data_rv$numeric))
+    })
+    output$report_response_selector <- renderUI({
+      selectInput("report_response_var", "Select Response Variable:", choices = names(data_rv$numeric), selected = names(data_rv$numeric)[1])
+    })
+  })
+  
+  # --- Data Preprocessing Logic ---
+  output$missing_data_plot <- renderPlot({
+    req(data_rv$numeric)
+    vis_miss(data_rv$numeric) + theme_publication()
+  })
+  
+  shiny::observeEvent(input$preprocess_data, {
+    req(data_rv$numeric)
+    
+    withProgress(message = 'Preprocessing Data...', {
+      
+      df <- data_rv$numeric
+      
+      # Imputation
+      if (input$imputation_method != "None") {
+        # FIX: Ensure the method is passed as a vector to preProcess
+        impute_model <- preProcess(df, method = c(input$imputation_method))
+        df <- predict(impute_model, df)
+      }
+      
+      # Transformation
+      if (input$transform_method != "None") {
+        req(input$transform_var)
+        if (input$transform_method == "Box-Cox") {
+          bc_model <- preProcess(df, method = "BoxCox")
+          df <- predict(bc_model, df)
+        } else if (input$transform_method == "Log") {
+          df[[input$transform_var]] <- log(df[[input$transform_var]] + 1)
+        } else if (input$transform_method == "Square Root") {
+          df[[input$transform_var]] <- sqrt(df[[input$transform_var]])
+        }
+      }
+      
+      data_rv$processed <- df
+      showNotification("Preprocessing applied successfully!", type = "message")
+    })
+  })
+  
+  output$preprocessed_data_preview <- renderDT({
+    req(data_rv$processed)
+    datatable(data_rv$processed, options = list(scrollX = TRUE, pageLength = 5))
+  })
+  
+  # --- Descriptive Analysis Logic ---
+  shiny::observeEvent(input$run_desc_stats, {
+    req(data_rv$processed)
+    
+    summary_df <- data_rv$processed %>%
+      summarise(across(everything(), list(
+        Min = ~min(.x, na.rm = TRUE),
+        `1st Qu.` = ~quantile(.x, 0.25, na.rm = TRUE),
+        Median = ~median(.x, na.rm = TRUE),
+        Mean = ~mean(.x, na.rm = TRUE),
+        `3rd Qu.` = ~quantile(.x, 0.75, na.rm = TRUE),
+        Max = ~max(.x, na.rm = TRUE)
+      ))) %>%
+      pivot_longer(everything(),
+                   names_to = c("Variable", "Stat"),
+                   names_sep = "_") %>%
+      pivot_wider(names_from = Stat, values_from = value)
+    
+    data_rv$summary_stats <- summary_df
+    
+    output$summary_stats_table <- renderDT({
+      datatable(summary_df, options = list(scrollX = TRUE))
+    })
+  })
+  
+  shiny::observeEvent(input$run_corrplot, {
+    req(data_rv$processed)
+    
+    corr_matrix <- cor(data_rv$processed, use = "complete.obs")
+    data_rv$corr_matrix <- corr_matrix
+    
+    output$corr_heatmap <- renderPlot({
+      corrplot::corrplot(corr_matrix, method = input$corrplot_method, order = "hclust", type = "upper",
+                         tl.cex = 0.7, title = "Descriptor Correlation Heatmap", mar=c(0,0,1,0))
+    })
+    
+    output$desc_discussion_ui <- renderUI({
+      req(data_rv$summary_stats, data_rv$corr_matrix)
+      wellPanel(
+        h4("Discussion of Results"),
+        generate_desc_discussion(data_rv$summary_stats, data_rv$corr_matrix)
+      )
+    })
+  })
+  
+  # --- PCA and Clustering Logic ---
+  shiny::observeEvent(input$run_pca, {
+    req(data_rv$processed)
+    data_scaled <- scale(data_rv$processed, center = TRUE, scale = TRUE)
+    pca <- prcomp(data_scaled)
+    data_rv$pca_results <- pca
+    
+    output$scree_plot <- renderPlot({
+      eigs <- pca$sdev^2
+      variance_df <- data.frame(
+        PC = 1:length(eigs),
+        Variance = eigs,
+        Proportion = eigs / sum(eigs),
+        Cumulative = cumsum(eigs / sum(eigs))
+      )
+      
+      ggplot(variance_df, aes(x = PC)) +
+        geom_bar(aes(y = Proportion * 100), stat = "identity", fill = "steelblue", alpha = 0.8) +
+        geom_line(aes(y = Cumulative * 100), color = "red", size = 1.2) +
+        geom_point(aes(y = Cumulative * 100), color = "red", size = 3) +
+        scale_y_continuous(
+          name = "Variance Explained (%)",
+          sec.axis = sec_axis(~., name = "Cumulative Variance Explained (%)")
+        ) +
+        labs(title = "Scree Plot", x = "Principal Component") +
+        theme_publication()
+    })
+    
+    output$pca_scores_plot <- renderPlotly({
+      scores <- as.data.frame(pca$x)
+      p <- ggplot(scores, aes(x = PC1, y = PC2, text = paste("Sample:", rownames(scores)))) +
+        geom_point(alpha = 0.7, size = 2.5) +
+        geom_hline(yintercept = 0, color = "gray70", linetype = "dashed") +
+        geom_vline(xintercept = 0, color = "gray70", linetype = "dashed") +
+        coord_fixed() +
+        theme_publication() +
+        labs(title = "PCA Scores Plot")
+      ggplotly(p, tooltip="text")
+    })
+    
+    output$pca_loadings_plot <- renderPlotly({
+      loadings <- as.data.frame(pca$rotation)
+      p <- ggplot(loadings, aes(x = PC1, y = PC2, text = paste("Variable:", rownames(loadings)))) +
+        geom_point(alpha = 0.5) +
+        theme_publication() +
+        labs(title = "PCA Loadings Plot")
+      ggplotly(p, tooltip="text")
+    })
+    
+    output$pca_discussion_ui <- renderUI({
+      req(data_rv$pca_results)
+      wellPanel(
+        h4("Discussion of Results"),
+        generate_pca_discussion(data_rv$pca_results)
+      )
+    })
+  })
+  
+  shiny::observeEvent(input$run_kmeans, {
+    req(data_rv$pca_results)
+    scores <- as.data.frame(data_rv$pca_results$x)
+    kmeans_result <- kmeans(scores[, 1:2], centers = input$kmeans_clusters, nstart = 25)
+    scores$cluster <- as.factor(kmeans_result$cluster)
+    
+    output$pca_scores_plot <- renderPlotly({
+      p <- ggplot(scores, aes(x = PC1, y = PC2, color = cluster, text = paste("Sample:", rownames(scores)))) +
+        geom_point(alpha = 0.8, size = 2) +
+        geom_hline(yintercept = 0, color = "gray70", linetype = "dashed") +
+        geom_vline(xintercept = 0, color = "gray70", linetype = "dashed") +
+        coord_fixed() +
+        theme_publication() +
+        labs(title = paste("K-Means Clustering on PCA Scores (k =", input$kmeans_clusters, ")"))
+      ggplotly(p, tooltip="text")
+    })
+  })
+  
+  shiny::observeEvent(input$run_hclust, {
+    req(data_rv$pca_results)
+    scores <- as.data.frame(data_rv$pca_results$x)
+    dist_matrix <- dist(scores[, 1:5]) # Use first 5 PCs
+    hclust_result <- hclust(dist_matrix, method = "ward.D2")
+    
+    output$dendrogram_plot <- renderPlot({
+      plot(hclust_result, main = "Hierarchical Clustering Dendrogram", xlab = "Samples", sub = "")
+    })
+  })
+  
+  shiny::observeEvent(input$run_ks_on_pca, {
+    req(data_rv$pca_results)
+    
+    scores <- data_rv$pca_results$x
+    num_select <- input$ks_select_n
+    
+    if (num_select >= nrow(scores)) {
+      showNotification("Number to select must be less than the total number of samples.", type = "warning")
+      return()
+    }
+    
+    ks_result <- kenStone(scores, k = num_select, metric = "euclid")
+    
+    scores_df <- as.data.frame(scores)
+    scores_df$Selection <- "Not Selected"
+    scores_df$Selection[ks_result$model] <- "Selected"
+    
+    output$pca_scores_plot <- renderPlotly({
+      p <- ggplot(scores_df, aes(x = PC1, y = PC2, color = Selection, shape = Selection, text = paste("Sample:", rownames(scores_df)))) +
+        geom_point(alpha = 0.8, size = 2.5) +
+        geom_hline(yintercept = 0, color = "gray70", linetype = "dashed") +
+        geom_vline(xintercept = 0, color = "gray70", linetype = "dashed") +
+        coord_fixed() +
+        scale_shape_manual(values = c("Selected" = 17, "Not Selected" = 16)) +
+        scale_color_manual(values = c("Selected" = "red", "Not Selected" = "black")) +
+        theme_publication() +
+        labs(title = "Kennard-Stone Selection on PCA Scores")
+      ggplotly(p, tooltip="text")
+    })
+  })
+  
+  # --- Automated MLR Logic ---
+  shiny::observeEvent(input$run_auto_mlr, {
+    req(data_rv$processed, input$mlr_response_var)
+    
+    log <- c("--- Starting Automated MLR Analysis ---")
+    data <- data_rv$processed
+    response_var <- input$mlr_response_var
+    
+    cor_matrix <- cor(data, use = "complete.obs")
+    cor_target <- cor_matrix[, response_var]
+    selected_vars <- names(cor_target[abs(cor_target) > input$corr_threshold & names(cor_target) != response_var])
+    log <- c(log, paste("Step 1: Found", length(selected_vars), "predictors with |correlation| >", input$corr_threshold, "with response."))
+    data_selected <- data %>% select(all_of(c(response_var, selected_vars)))
+    
+    alias_info <- alias(lm(as.formula(paste(response_var, "~ .")), data = data_selected))
+    if (length(alias_info$Complete) > 0) {
+      aliased_vars <- rownames(alias_info$Complete)
+      log <- c(log, paste("Step 2: Removing aliased variables:", paste(aliased_vars, collapse = ", ")))
+      data_selected <- data_selected %>% select(-all_of(aliased_vars))
+    } else {
+      log <- c(log, "Step 2: No aliased variables found.")
+    }
+    
+    if (ncol(data_selected) > 2) {
+      cor_matrix_selected <- cor(data_selected[-1], use = "complete.obs")
+      highly_correlated <- findCorrelation(cor_matrix_selected, cutoff = input$predictor_corr_cutoff)
+      if (length(highly_correlated) > 0) {
+        removed_vars <- colnames(data_selected[-1])[highly_correlated]
+        log <- c(log, paste("Step 3: Removing highly correlated variables:", paste(removed_vars, collapse = ", ")))
+        data_selected <- data_selected %>% select(-all_of(removed_vars))
+      } else {
+        log <- c(log, "Step 3: No highly correlated predictors to remove.")
+      }
+    }
+    
+    log <- c(log, "Step 4: Checking for multicollinearity using VIF...")
+    while(ncol(data_selected) > 2) {
+      model_vif <- lm(as.formula(paste(response_var, "~ .")), data = data_selected)
+      vif_values <- vif(model_vif)
+      if (any(vif_values > input$vif_threshold)) {
+        remove_var <- names(which.max(vif_values))
+        log <- c(log, paste("  - Removing", remove_var, "with VIF =", round(max(vif_values), 2)))
+        data_selected <- data_selected %>% select(-all_of(remove_var))
+      } else {
+        log <- c(log, "  - All VIF values are below the threshold.")
+        break
+      }
+    }
+    
+    log <- c(log, paste("--- Feature Selection Complete. Final predictors:", paste(colnames(data_selected)[-1], collapse = ", "), "---"))
+    
+    final_model <- lm(as.formula(paste(response_var, "~ .")), data = data_selected)
+    
+    data_rv$mlr_results <- list(
+      model = final_model, data = data_selected,
+      response = response_var, log = log
+    )
+    
+    output$mlr_log <- renderPrint({ cat(paste(data_rv$mlr_results$log, collapse = "\n")) })
+    output$mlr_summary <- renderPrint({ summary(data_rv$mlr_results$model) })
+    output$mlr_equation <- renderPrint({
+      coefs <- coef(data_rv$mlr_results$model)
+      eq <- paste0(response_var, " = ", round(coefs[1], 3),
+                   paste0(sprintf(" %+ .3f * %s", coefs[-1], names(coefs[-1])), collapse = ""))
+      cat(eq)
+    })
+    
+    output$mlr_response_hist <- renderPlot({
+      ggplot(data_rv$mlr_results$data, aes_string(x = response_var)) +
+        geom_histogram(fill = "gray", color = "black", bins = 30, alpha = 0.6) +
+        theme_publication() + labs(title = "Distribution of Response Variable")
+    })
+    
+    output$mlr_actual_vs_pred <- renderPlotly({
+      preds <- predict(data_rv$mlr_results$model, newdata = data_rv$mlr_results$data)
+      df_plot <- data.frame(Actual = data_rv$mlr_results$data[[response_var]], Predicted = preds)
+      p <- ggplot(df_plot, aes(x = Actual, y = Predicted)) +
+        geom_point(color = "blue", alpha = 0.7) +
+        geom_abline(slope = 1, intercept = 0, color = "red") +
+        theme_publication() + labs(title = "Actual vs. Predicted Values")
+      ggplotly(p)
+    })
+    
+    output$mlr_residuals_plot <- renderPlotly({
+      df_plot <- data.frame(Fitted = fitted(data_rv$mlr_results$model), Residuals = residuals(data_rv$mlr_results$model))
+      p <- ggplot(df_plot, aes(x = Fitted, y = Residuals)) +
+        geom_point(color = "blue", alpha = 0.7) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+        theme_publication() + labs(title = "Residuals vs. Fitted Values")
+      ggplotly(p)
+    })
+    
+    output$mlr_var_importance <- renderPlotly({
+      imp <- abs(summary(data_rv$mlr_results$model)$coefficients[-1, "t value"])
+      imp_df <- data.frame(Variable = names(imp), Importance = imp)
+      p <- ggplot(imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+        geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+        coord_flip() + theme_publication() + labs(title = "Variable Importance (t-statistic)", x = "Predictor")
+      ggplotly(p)
+    })
+    
+    output$mlr_scatter_plots_ui <- renderUI({
+      plots <- lapply(colnames(data_rv$mlr_results$data)[-1], function(var) {
+        plotlyOutput(paste0("scatter_", var))
+      })
+      do.call(tagList, plots)
+    })
+    
+    for (var in colnames(data_rv$mlr_results$data)[-1]) {
+      local({
+        my_var <- var
+        output[[paste0("scatter_", my_var)]] <- renderPlotly({
+          p <- ggplot(data_rv$mlr_results$data, aes_string(x = my_var, y = response_var)) +
+            geom_point(color = "blue", alpha = 0.7) +
+            geom_smooth(method = "lm", color = "red") +
+            theme_publication() +
+            ggtitle(paste("Scatterplot of", my_var, "vs", response_var))
+          ggplotly(p)
+        })
+      })
+    }
+  })
+  
+  output$download_selected_data <- downloadHandler(
+    filename = function() { "selected_data.csv" },
+    content = function(file) {
+      req(data_rv$mlr_results)
+      write.csv(data_rv$mlr_results$data, file, row.names = FALSE)
+    }
+  )
+  
+  # --- Hyperparameter Tuning Logic ---
+  shiny::observeEvent(input$run_tuning, {
+    req(data_rv$processed, input$tune_response_var)
+    
+    withProgress(message = 'Running Hyperparameter Tuning...', value = 0, {
+      data <- data_rv$processed
+      response_var <- input$tune_response_var
+      
+      model_short_name <- switch(input$tune_model_type,
+                                 "Random Forest" = "rf",
+                                 "XGBoost" = "xgbTree",
+                                 "SVM" = "svmRadial")
+      
+      train_control <- trainControl(method = "cv", number = input$tune_cv_folds)
+      
+      incProgress(0.2, detail = paste("Tuning", input$tune_model_type))
+      
+      tuned_model <- train(
+        as.formula(paste(response_var, "~ .")),
+        data = data,
+        method = model_short_name,
+        trControl = train_control,
+        tuneLength = input$tune_grid_size
+      )
+      
+      data_rv$tune_results <- tuned_model
+      
+      incProgress(0.8, detail = "Finalizing results...")
+      
+      output$tuning_plot <- renderPlot({
+        plot(data_rv$tune_results) + theme_publication()
+      })
+      
+      output$best_params <- renderPrint({
+        print(data_rv$tune_results$bestTune)
+      })
+      
+      output$tuning_discussion_ui <- renderUI({
+        req(data_rv$tune_results)
+        wellPanel(
+          h4("Discussion of Results"),
+          generate_tuning_discussion(data_rv$tune_results)
+        )
+      })
+    })
+  })
+  
+  # --- Publication Analysis Logic ---
+  shiny::observeEvent(input$run_pub_analysis, {
+    req(data_rv$processed, input$pub_response_var)
+    
+    withProgress(message = 'Running Publication Analysis', value = 0, {
+      
+      log <- c("--- Starting Publication Analysis ---")
+      data_num <- data_rv$processed
+      response_var <- input$pub_response_var
+      
+      # Data Splitting
+      incProgress(0.1, detail = "Splitting data...")
+      set.seed(input$pub_seed)
+      train_index <- createDataPartition(data_num[[response_var]], p = input$pub_split_ratio, list = FALSE)
+      train_data <- data_num[train_index, ]
+      test_data  <- data_num[-train_index, ]
+      log <- c(log, paste("Data split:", nrow(train_data), "training and", nrow(test_data), "test samples."))
+      
+      # Feature Selection on Training Data
+      incProgress(0.2, detail = "Feature selection...")
+      cor_matrix_train <- cor(train_data, use = "complete.obs")
+      cor_target <- abs(cor_matrix_train[, response_var])
+      selected_vars <- names(cor_target[cor_target > 0.3])
+      selected_vars <- setdiff(selected_vars, response_var)
+      data_train_selected <- train_data %>% select(all_of(c(response_var, selected_vars)))
+      log <- c(log, paste("Selected", length(selected_vars), "variables based on correlation with response."))
+      
+      predictors_only <- data_train_selected %>% select(-all_of(response_var))
+      if (ncol(predictors_only) > 1) {
+        cor_matrix_preds <- cor(predictors_only, use = "complete.obs")
+        highly_correlated_idx <- findCorrelation(cor_matrix_preds, cutoff = 0.85)
+        if (length(highly_correlated_idx) > 0) {
+          hc_names <- colnames(predictors_only)[highly_correlated_idx]
+          log <- c(log, paste("Removing highly correlated predictors:", paste(hc_names, collapse = ", ")))
+          data_train_selected <- data_train_selected %>% select(-all_of(hc_names))
+        }
+      }
+      
+      # VIF Filtering
+      while(TRUE) {
+        if (ncol(data_train_selected) < 3) break
+        model_vif <- lm(as.formula(paste(response_var, "~ .")), data = data_train_selected)
+        if (any(is.na(coef(model_vif)))) break # Stop if aliased
+        vif_values <- tryCatch(vif(model_vif), error = function(e) NULL)
+        if (is.null(vif_values) || any(is.na(vif_values))) break
+        if (max(vif_values) > 4) {
+          remove_var <- names(which.max(vif_values))
+          log <- c(log, paste("Removing", remove_var, "due to high VIF."))
+          data_train_selected <- data_train_selected %>% select(-all_of(remove_var))
+        } else {
+          break
+        }
+      }
+      final_predictors <- setdiff(colnames(data_train_selected), response_var)
+      log <- c(log, paste("Final predictors:", paste(final_predictors, collapse = ", ")))
+      
+      # Model Training & Evaluation
+      incProgress(0.5, detail = "Training and evaluating...")
+      model_formula <- as.formula(paste(response_var, "~", paste(final_predictors, collapse = " + ")))
+      final_model <- lm(model_formula, data = train_data)
+      
+      pred_train <- predict(final_model, newdata = train_data)
+      perf_train <- data.frame(DataSet = "Training", RMSE = sqrt(mean((train_data[[response_var]] - pred_train)^2)), Rsquare = summary(final_model)$r.squared)
+      
+      test_data_final <- test_data %>% select(all_of(c(response_var, final_predictors)))
+      pred_test <- predict(final_model, newdata = test_data_final)
+      perf_test <- data.frame(DataSet = "Testing", RMSE = sqrt(mean((test_data_final[[response_var]] - pred_test)^2)), Rsquare = cor(test_data_final[[response_var]], pred_test)^2)
+      performance <- bind_rows(perf_train, perf_test)
+      
+      # Refit on Full Data for Diagnostics
+      incProgress(0.7, detail = "Running diagnostics...")
+      data_final_selected <- data_num %>% select(all_of(c(response_var, final_predictors)))
+      model_full <- lm(model_formula, data = data_final_selected)
+      
+      # Diagnostics
+      shapiro_test <- if(length(unique(model_full$residuals)) > 1) shapiro.test(model_full$residuals) else list(p.value=1)
+      bp_test <- bptest(model_full)
+      
+      # [NEW] Generate Model Equation
+      coefs <- coef(model_full)
+      model_equation <- paste0(response_var, " = ", round(coefs[1], 3),
+                               paste0(sprintf(" %+ .3f * %s", coefs[-1], names(coefs[-1])), collapse = ""))
+      
+      # Store results
+      data_rv$pub_results <- list(
+        log = log,
+        performance = performance,
+        model = model_full,
+        equation = model_equation,
+        final_data = data_final_selected,
+        diagnostics = list(shapiro = shapiro_test, bptest = bp_test),
+        train_data = train_data %>% select(all_of(c(response_var, final_predictors))),
+        test_data = test_data %>% select(all_of(c(response_var, final_predictors))),
+        train_indices = train_index
+      )
+    })
+  })
+  
+  output$pub_log <- renderPrint({ cat(paste(data_rv$pub_results$log, collapse = "\n")) })
+  output$pub_performance_table <- renderDT({
+    req(data_rv$pub_results)
+    datatable(data_rv$pub_results$performance %>% mutate(across(where(is.numeric), round, 4)))
+  })
+  
+  output$pub_model_equation <- renderPrint({
+    req(data_rv$pub_results)
+    cat(data_rv$pub_results$equation)
+  })
+  
+  output$pub_discussion <- renderUI({
+    req(data_rv$pub_results)
+    generate_pub_discussion(data_rv$pub_results)
+  })
+  
+  output$next_step_ui <- renderUI({
+    req(data_rv$pub_results)
+    wellPanel(
+      h4("Next Step Suggestion"),
+      p("Now that you have a model, you can assess its reliability and check for chance correlations using the advanced validation tools."),
+      tags$ul(
+        tags$li("Go to the ", tags$b("Advanced Validation > Applicability Domain")),
+        tags$li("Go to the ", tags$b("Advanced Validation > Y-Scrambling"))
+      )
+    )
+  })
+  
+  output$pub_actual_vs_pred_plot <- renderPlotly({
+    req(data_rv$pub_results)
+    
+    train_df <- data_rv$pub_results$train_data
+    test_df <- data_rv$pub_results$test_data
+    model <- data_rv$pub_results$model
+    response_var <- all.vars(formula(model))[1]
+    
+    plot_df <- rbind(
+      data.frame(Actual = train_df[[response_var]], Predicted = predict(model, newdata=train_df), Set = "Training"),
+      data.frame(Actual = test_df[[response_var]], Predicted = predict(model, newdata=test_df), Set = "Test")
+    )
+    
+    r2_train <- data_rv$pub_results$performance$Rsquare[1]
+    rmse_train <- data_rv$pub_results$performance$RMSE[1]
+    r2_test <- data_rv$pub_results$performance$Rsquare[2]
+    rmse_test <- data_rv$pub_results$performance$RMSE[2]
+    
+    p <- ggplot(plot_df, aes(x = Actual, y = Predicted, color = Set, shape = Set)) +
+      geom_point(alpha = 0.8, size=input$pub_point_size) +
+      geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed", linewidth=1) +
+      scale_color_manual(values = c("Training" = input$pub_train_color, "Test" = input$pub_test_color)) +
+      labs(
+        title = input$pub_avp_title,
+        subtitle = paste0(
+          "Train: R² = ", round(r2_train, 3), ", RMSE = ", round(rmse_train, 3),
+          " | Test: R² = ", round(r2_test, 3), ", RMSE = ", round(rmse_test, 3)
+        )
+      ) +
+      theme_publication(base_size = input$pub_base_font_size) +
+      coord_fixed()
+    ggplotly(p)
+  })
+  
+  output$pub_var_imp_plot <- renderPlotly({
+    req(data_rv$pub_results)
+    var_imp <- varImp(data_rv$pub_results$model, scale = FALSE)
+    var_imp_df <- data.frame(Variable = rownames(var_imp), Importance = var_imp$Overall)
+    p <- ggplot(var_imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+      geom_bar(stat = "identity", fill = "steelblue") +
+      coord_flip() +
+      ggtitle(input$pub_imp_title) +
+      xlab(NULL) + ylab("Absolute t-value") +
+      theme_publication(base_size = input$pub_base_font_size)
+    ggplotly(p)
+  })
+  
+  output$pub_diagnostic_plots <- renderPlot({
+    req(data_rv$pub_results)
+    model <- data_rv$pub_results$model
+    
+    p1 <- ggplot(model, aes(.fitted, .resid)) + geom_point() +
+      geom_hline(yintercept = 0, linetype="dashed", color="red") +
+      labs(x="Fitted values", y="Residuals", title="Residuals vs Fitted") + theme_publication(base_size=12)
+    
+    p2 <- ggplot(model, aes(sample = .stdresid)) + stat_qq() + stat_qq_line(color="red") +
+      labs(title="Normal Q-Q") + theme_publication(base_size=12)
+    
+    p3 <- ggplot(model, aes(.fitted, sqrt(abs(.stdresid)))) + geom_point() +
+      labs(x="Fitted values", y="Sqrt(|Standardized Residuals|)", title="Scale-Location") + theme_publication(base_size=12)
+    
+    p4 <- ggplot(model, aes(x = .hat, y = .stdresid)) + geom_point() +
+      labs(x="Leverage", y="Standardized Residuals", title="Residuals vs Leverage") + theme_publication(base_size=12)
+    
+    ggarrange(p1, p2, p3, p4, ncol=2, nrow=2)
+  })
+  
+  output$pub_split_pca_plot <- renderPlotly({
+    req(data_rv$pub_results)
+    
+    final_data <- data_rv$pub_results$final_data
+    response_var <- all.vars(formula(data_rv$pub_results$model))[1]
+    predictors <- final_data %>% select(-all_of(response_var))
+    
+    pca <- prcomp(predictors, scale. = TRUE)
+    scores <- as.data.frame(pca$x)
+    scores$Set <- "Test"
+    scores[data_rv$pub_results$train_indices,] <- "Training"
+    
+    p <- ggplot(scores, aes(x=PC1, y=PC2, color=Set, shape=Set, text = paste("Sample:", rownames(scores)))) +
+      geom_point(size=input$pub_point_size, alpha=0.8) +
+      scale_color_manual(values = c("Training" = input$pub_train_color, "Test" = input$pub_test_color)) +
+      theme_publication(base_size = input$pub_base_font_size) +
+      labs(title="Train/Test Split in PCA Space",
+           subtitle="Based on final selected predictors")
+    ggplotly(p, tooltip = "text")
+  })
+  
+  output$pub_selected_corr_plot <- renderPlot({
+    req(data_rv$pub_results)
+    
+    final_data <- data_rv$pub_results$final_data
+    response_var <- all.vars(formula(data_rv$pub_results$model))[1]
+    predictors <- final_data %>% select(-all_of(response_var))
+    
+    corr_matrix <- cor(predictors, use="complete.obs")
+    corrplot::corrplot(corr_matrix, method="color", order="hclust", type="upper",
+                       title="Correlation of Final Predictors", mar=c(0,0,1,0),
+                       tl.cex=0.8)
+  })
+  
+  output$download_pub_log <- downloadHandler(
+    filename = function() { "publication_analysis_log.txt" },
+    content = function(file) {
+      req(data_rv$pub_results)
+      writeLines(data_rv$pub_results$log, file)
+    }
+  )
+  
+  output$download_pub_final_data <- downloadHandler(
+    filename = function() { "publication_final_data.csv" },
+    content = function(file) {
+      req(data_rv$pub_results)
+      write.csv(data_rv$pub_results$final_data, file, row.names = FALSE)
+    }
+  )
+  
+  output$download_pub_plots <- downloadHandler(
+    filename = function() { "publication_plots.png" },
+    content = function(file) {
+      req(data_rv$pub_results)
+      
+      # Re-generate plots for saving to ensure they are available
+      p1_save <- {
+        train_df <- data_rv$pub_results$train_data
+        test_df <- data_rv$pub_results$test_data
+        model <- data_rv$pub_results$model
+        response_var <- all.vars(formula(model))[1]
+        plot_df <- rbind(
+          data.frame(Actual = train_df[[response_var]], Predicted = predict(model, newdata=train_df), Set = "Training"),
+          data.frame(Actual = test_df[[response_var]], Predicted = predict(model, newdata=test_df), Set = "Test")
+        )
+        r2_train <- data_rv$pub_results$performance$Rsquare[1]
+        rmse_train <- data_rv$pub_results$performance$RMSE[1]
+        r2_test <- data_rv$pub_results$performance$Rsquare[2]
+        rmse_test <- data_rv$pub_results$performance$RMSE[2]
+        ggplot(plot_df, aes(x = Actual, y = Predicted, color = Set, shape = Set)) +
+          geom_point(alpha = 0.8, size=3) +
+          geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed", linewidth=1) +
+          labs(title = "Actual vs. Predicted Values",
+               subtitle = paste0("Train: R² = ", round(r2_train, 3), " | Test: R² = ", round(r2_test, 3))) +
+          theme_publication() + coord_fixed()
+      }
+      
+      p2_save <- {
+        var_imp <- varImp(data_rv$pub_results$model, scale = FALSE)
+        var_imp_df <- data.frame(Variable = rownames(var_imp), Importance = var_imp$Overall)
+        ggplot(var_imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+          geom_bar(stat = "identity", fill = "steelblue") +
+          coord_flip() + ggtitle("Variable Importance") +
+          xlab(NULL) + ylab("Absolute t-value") +
+          theme_publication()
+      }
+      
+      ggsave(file, plot = ggarrange(p1_save, p2_save, ncol=2), width = 12, height = 6, dpi=300)
+    }
+  )
+  
+  # --- XGBoost Analysis Logic ---
+  shiny::observeEvent(input$run_xgb, {
+    req(data_rv$processed, input$xgb_response_var)
+    
+    withProgress(message = 'Training XGBoost Model...', value = 0, {
+      
+      data <- data_rv$processed
+      response_var <- input$xgb_response_var
+      
+      # Data Splitting
+      incProgress(0.1, detail = "Splitting data...")
+      set.seed(123) # for reproducibility
+      train_index <- createDataPartition(data[[response_var]], p = input$xgb_split_ratio, list = FALSE)
+      train_data <- data[train_index, ]
+      test_data  <- data[-train_index, ]
+      
+      x_train <- as.matrix(train_data %>% select(-all_of(response_var)))
+      y_train <- train_data[[response_var]]
+      x_test <- as.matrix(test_data %>% select(-all_of(response_var)))
+      y_test <- test_data[[response_var]]
+      
+      dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+      dtest <- xgb.DMatrix(data = x_test, label = y_test)
+      
+      # Model Training
+      incProgress(0.3, detail = "Training model...")
+      params <- list(
+        objective = "reg:squarederror",
+        max_depth = input$xgb_max_depth,
+        eta = input$xgb_eta
+      )
+      
+      xgb_model <- xgb.train(
+        params = params,
+        data = dtrain,
+        nrounds = input$xgb_nrounds,
+        watchlist = list(train = dtrain, test = dtest),
+        print_every_n = 10,
+        early_stopping_rounds = 10
+      )
+      
+      incProgress(0.7, detail = "Evaluating performance...")
+      
+      # Predictions and Performance
+      pred_train <- predict(xgb_model, dtrain)
+      pred_test <- predict(xgb_model, dtest)
+      
+      perf_train <- eval_results(y_train, pred_train, train_data)
+      perf_test <- eval_results(y_test, pred_test, test_data)
+      
+      performance <- rbind(
+        data.frame(DataSet = "Training", perf_train),
+        data.frame(DataSet = "Testing", perf_test)
+      )
+      
+      # Variable Importance
+      importance_matrix <- xgb.importance(model = xgb_model)
+      
+      data_rv$xgb_results <- list(
+        model = xgb_model,
+        performance = performance,
+        plot_data = rbind(
+          data.frame(Actual = y_train, Predicted = pred_train, Set = "Training"),
+          data.frame(Actual = y_test, Predicted = pred_test, Set = "Test")
+        ),
+        importance = importance_matrix
+      )
+      
+      output$xgb_performance <- renderPrint({
+        print(data_rv$xgb_results$performance)
+      })
+      
+      output$xgb_actual_vs_pred_plot <- renderPlotly({
+        p <- ggplot(data_rv$xgb_results$plot_data, aes(x = Actual, y = Predicted, color = Set)) +
+          geom_point(alpha = 0.7) +
+          geom_abline(slope = 1, intercept = 0, color = "red") +
+          theme_publication() +
+          labs(title = "XGBoost: Actual vs. Predicted")
+        ggplotly(p)
+      })
+      
+      output$xgb_var_imp_plot <- renderPlotly({
+        p <- xgb.ggplot.importance(importance_matrix = data_rv$xgb_results$importance) +
+          theme_publication() +
+          labs(title = "XGBoost: Feature Importance")
+        ggplotly(p)
+      })
+      
+      output$xgb_error_plot <- renderPlotly({
+        eval_log <- as.data.frame(xgb_model$evaluation_log)
+        p <- ggplot(eval_log, aes(x = iter)) +
+          geom_line(aes(y = train_rmse, color = "Train")) +
+          geom_line(aes(y = test_rmse, color = "Test")) +
+          theme_publication() +
+          labs(title = "XGBoost: Training & Test Error", x = "Iteration", y = "RMSE", color = "Set")
+        ggplotly(p)
+      })
+      
+      output$xgb_discussion_ui <- renderUI({
+        req(data_rv$xgb_results)
+        wellPanel(
+          h4("Discussion of Results"),
+          generate_xgb_discussion(data_rv$xgb_results)
+        )
+      })
+    })
+  })
+  
+  # --- Analysis Dashboard Logic ---
+  shiny::observeEvent(input$run_dashboard, {
+    req(data_rv$pub_results)
+    
+    withProgress(message = "Generating Dashboard...", {
+      
+      # Re-generate plots as ggplot objects
+      p1 <- {
+        train_df <- data_rv$pub_results$train_data
+        test_df <- data_rv$pub_results$test_data
+        model <- data_rv$pub_results$model
+        response_var <- all.vars(formula(model))[1]
+        plot_df <- rbind(
+          data.frame(Actual = train_df[[response_var]], Predicted = predict(model, newdata=train_df), Set = "Training"),
+          data.frame(Actual = test_df[[response_var]], Predicted = predict(model, newdata=test_df), Set = "Test")
+        )
+        ggplot(plot_df, aes(x = Actual, y = Predicted, color = Set, shape = Set)) +
+          geom_point(alpha = 0.8, size=3) +
+          geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed", size=1) +
+          labs(title = "Actual vs. Predicted") +
+          theme_publication() + coord_fixed()
+      }
+      
+      p2 <- {
+        var_imp <- varImp(data_rv$pub_results$model, scale = FALSE)
+        var_imp_df <- data.frame(Variable = rownames(var_imp), Importance = var_imp$Overall)
+        ggplot(var_imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+          geom_bar(stat = "identity", fill = "steelblue") +
+          coord_flip() + ggtitle("Variable Importance") +
+          xlab(NULL) + ylab("Absolute t-value") +
+          theme_publication()
+      }
+      
+      p3 <- {
+        final_data <- data_rv$pub_results$final_data
+        response_var <- all.vars(formula(data_rv$pub_results$model))[1]
+        predictors <- final_data %>% select(-all_of(response_var))
+        pca <- prcomp(predictors, scale. = TRUE)
+        scores <- as.data.frame(pca$x)
+        scores$Set <- "Test"
+        scores[data_rv$pub_results$train_indices,] <- "Training"
+        ggplot(scores, aes(x=PC1, y=PC2, color=Set, shape=Set)) +
+          geom_point(size=3, alpha=0.8) +
+          theme_publication() +
+          labs(title="Train/Test Split in PCA Space")
+      }
+      
+      p4 <- {
+        final_data <- data_rv$pub_results$final_data
+        response_var <- all.vars(formula(data_rv$pub_results$model))[1]
+        predictors <- final_data %>% select(-all_of(response_var))
+        corr_matrix <- cor(predictors, use="complete.obs")
+        ggcorrplot(corr_matrix, hc.order = TRUE, type = "upper",
+                   outline.col = "white", lab = TRUE, lab_size = 3) +
+          labs(title = "Correlation of Final Predictors")
+      }
+      
+      dashboard <- ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2, common.legend = TRUE, legend = "bottom")
+      data_rv$dashboard_plot <- dashboard
+      
+      output$dashboard_plot <- renderPlot({
+        print(data_rv$dashboard_plot)
+      })
+    })
+  })
+  
+  output$download_dashboard <- downloadHandler(
+    filename = function() { "analysis_dashboard.png" },
+    content = function(file) {
+      req(data_rv$dashboard_plot)
+      ggsave(file, plot = data_rv$dashboard_plot, width = 12, height = 10, dpi = 300)
+    }
+  )
+  
+  # --- Applicability Domain Logic ---
+  shiny::observeEvent(input$run_ad_analysis, {
+    req(data_rv$pub_results)
+    withProgress(message = "Running AD Analysis...", {
+      
+      model <- data_rv$pub_results$model
+      
+      if (model$rank < length(na.omit(coef(model)))) {
+        showNotification("Applicability Domain cannot be calculated because the model is rank-deficient (due to collinearity). Please re-run the Publication Analysis with different settings.", type = "warning", duration = 10)
+        return()
+      }
+      
+      train_data <- data_rv$pub_results$train_data
+      test_data <- data_rv$pub_results$test_data
+      
+      # Calculate leverage for training data
+      X <- model.matrix(model)
+      leverage <- hatvalues(model)
+      
+      # Warning leverage h*
+      p <- model$rank
+      n <- nrow(train_data)
+      h_star <- 3 * p / n
+      
+      # Standardized residuals
+      std_resid_train <- rstandard(model)
+      
+      # Predict for test set and calculate standardized residuals manually
+      preds_test <- predict(model, newdata = test_data)
+      resid_test <- test_data[[1]] - preds_test
+      sigma <- summary(model)$sigma
+      std_resid_test <- resid_test / sigma
+      
+      # Leverage for test set (projection approach)
+      X_train <- X
+      X_test <- model.matrix(delete.response(terms(model)), data = test_data)
+      leverage_test <- diag(X_test %*% solve(t(X_train) %*% X_train) %*% t(X_test))
+      
+      # Combine into a single data frame for plotting
+      train_plot_df <- data.frame(Leverage = leverage, StdResid = std_resid_train, Set = "Training", ID = names(leverage))
+      test_plot_df <- data.frame(Leverage = leverage_test, StdResid = std_resid_test, Set = "Test", ID = rownames(test_data))
+      plot_df <- rbind(train_plot_df, test_plot_df)
+      
+      plot_df$Status <- ifelse(plot_df$Leverage > h_star, "High Leverage", "In AD")
+      plot_df$Status[abs(plot_df$StdResid) > 3] <- "Outlier"
+      
+      data_rv$ad_results <- list(plot_df = plot_df, h_star = h_star)
+      
+      output$williams_plot <- renderPlotly({
+        p <- ggplot(plot_df, aes(x = Leverage, y = StdResid, color = Status, shape = Set, text = paste("ID:", ID))) +
+          geom_point(size = 2.5, alpha = 0.8) +
+          geom_hline(yintercept = c(-3, 3), linetype = "dashed", color = "red") +
+          geom_vline(xintercept = h_star, linetype = "dashed", color = "red") +
+          theme_publication() +
+          labs(title = "Williams Plot for Applicability Domain",
+               x = "Leverage (h)", y = "Standardized Residuals") +
+          annotate("text", x = h_star, y = max(plot_df$StdResid, na.rm=TRUE), label = paste("h* =", round(h_star, 2)), hjust = -0.1)
+        ggplotly(p, tooltip = "text")
+      })
+      
+      output$ad_outliers_table <- renderDT({
+        datatable(plot_df %>% filter(Status != "In AD"), options = list(pageLength = 5))
+      })
+      
+      output$ad_discussion_ui <- renderUI({
+        req(data_rv$ad_results)
+        wellPanel(
+          h4("Discussion of Results"),
+          generate_ad_discussion(data_rv$ad_results$plot_df, data_rv$ad_results$h_star)
+        )
+      })
+    })
+  })
+  
+  # --- Y-Scrambling Logic ---
+  shiny::observeEvent(input$run_y_scrambling, {
+    req(data_rv$pub_results)
+    withProgress(message = "Running Y-Scrambling...", value = 0, {
+      
+      train_data <- data_rv$pub_results$train_data
+      model_formula <- formula(data_rv$pub_results$model)
+      response_var <- all.vars(model_formula)[1]
+      original_r2 <- data_rv$pub_results$performance$Rsquare[1]
+      
+      scrambled_r2 <- numeric(input$scramble_iterations)
+      
+      for (i in 1:input$scramble_iterations) {
+        incProgress(1/input$scramble_iterations, detail = paste("Iteration", i))
+        
+        scrambled_train_data <- train_data
+        scrambled_train_data[[response_var]] <- sample(train_data[[response_var]])
+        
+        scrambled_model <- lm(model_formula, data = scrambled_train_data)
+        scrambled_r2[i] <- summary(scrambled_model)$r.squared
+      }
+      
+      data_rv$ys_results <- list(
+        original_r2 = original_r2,
+        scrambled_r2 = scrambled_r2
+      )
+      
+      output$y_scrambling_plot <- renderPlot({
+        plot_df <- data.frame(Rsquared = data_rv$ys_results$scrambled_r2)
+        ggplot(plot_df, aes(x = Rsquared)) +
+          geom_histogram(bins=20, fill="grey", color="black") +
+          geom_vline(xintercept = data_rv$ys_results$original_r2, color="blue", linetype="dashed", size=1.5) +
+          theme_publication() +
+          labs(title = "Y-Scrambling Results",
+               subtitle = "Distribution of R-squared from Scrambled Models",
+               x = "R-squared", y = "Frequency") +
+          annotate("text", x = data_rv$ys_results$original_r2, y = 5, label = "Original Model R²", color="blue", angle=90, vjust = -0.5)
+      })
+      
+      output$y_scrambling_summary <- renderPrint({
+        cat("Original Model Training R-squared:", round(data_rv$ys_results$original_r2, 4), "\n\n")
+        cat("Summary of Scrambled Model R-squared values:\n")
+        summary(data_rv$ys_results$scrambled_r2)
+      })
+      
+      output$ys_discussion_ui <- renderUI({
+        req(data_rv$ys_results)
+        wellPanel(
+          h4("Discussion of Results"),
+          generate_ys_discussion(data_rv$ys_results)
+        )
+      })
+    })
+  })
+  
+  # --- Automated Report Logic ---
+  shiny::observeEvent(input$run_summary_report, {
+    req(data_rv$processed, input$report_response_var)
+    
+    withProgress(message = "Generating Report...", {
+      
+      data_selected <- data_rv$processed
+      response_var <- input$report_response_var
+      
+      # Feature selection (simplified from MLR tab)
+      cor_matrix <- cor(data_selected, use = "complete.obs")
+      cor_target <- cor_matrix[, response_var]
+      selected_vars <- names(cor_target[abs(cor_target) > 0.3 & names(cor_target) != response_var])
+      data_selected <- data_selected %>% select(all_of(c(response_var, selected_vars)))
+      
+      cor_matrix_selected <- cor(data_selected[-1], use = "complete.obs")
+      highly_correlated <- findCorrelation(cor_matrix_selected, cutoff = 0.85)
+      if (length(highly_correlated) > 0) {
+        data_selected <- data_selected %>% select(-highly_correlated)
+      }
+      
+      model <- lm(as.formula(paste(response_var, "~ .")), data = data_selected)
+      
+      # Generate summary paragraph
+      coefficients <- coef(model)
+      model_equation <- paste0(response_var, " = ", round(coefficients[1], 3),
+                               paste(sprintf("%+.3f * %s", coefficients[-1], names(coefficients[-1])), collapse = " "))
+      
+      predictions <- predict(model, newdata = data_selected)
+      evaluation_results <- eval_results(data_selected[[response_var]], predictions, data_selected)
+      
+      var_importance <- abs(summary(model)$coefficients[-1, "t value"])
+      top_variables <- names(sort(var_importance, decreasing = TRUE))[1:min(3, length(var_importance))]
+      
+      summary_paragraph <- paste(
+        "The dataset was processed to remove highly correlated predictors, ensuring robust regression modeling.",
+        paste("A total of", nrow(data_selected), "samples were used, with", ncol(data_selected) - 1, "predictor variables selected after filtering."),
+        "\nThe multiple linear regression model was fitted, resulting in the following equation:\n", model_equation,
+        paste("\n\nModel performance showed an RMSE of", round(evaluation_results$RMSE, 3), "and an R-squared of", round(evaluation_results$Rsquare, 3)),
+        paste("indicating the model explains approximately", round(evaluation_results$Rsquare * 100, 2), "% of the variance."),
+        paste("\n\nThe most influential predictors were:", paste(top_variables, collapse = ", ")),
+        "\n\nOverall, this analysis provides insights into the key factors influencing the response variable."
+      )
+      
+      data_rv$report_results <- list(summary = summary_paragraph, model = model, data = data_selected, response = response_var)
+      
+      output$summary_report_output <- renderPrint({ cat(data_rv$report_results$summary) })
+      
+      output$report_actual_vs_pred <- renderPlot({
+        preds <- predict(data_rv$report_results$model, newdata = data_rv$report_results$data)
+        df_plot <- data.frame(Actual = data_rv$report_results$data[[response_var]], Predicted = preds)
+        ggplot(df_plot, aes(x = Actual, y = Predicted)) +
+          geom_point(color = "blue", alpha = 0.7) +
+          geom_abline(slope = 1, intercept = 0, color = "red") +
+          theme_minimal() + labs(title = "Actual vs. Predicted Values")
+      })
+      
+      output$report_residuals_plot <- renderPlot({
+        df_plot <- data.frame(Fitted = fitted(data_rv$report_results$model), Residuals = residuals(data_rv$report_results$model))
+        ggplot(df_plot, aes(x = Fitted, y = Residuals)) +
+          geom_point(color = "blue", alpha = 0.7) +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+          theme_minimal() + labs(title = "Residuals vs. Fitted Values")
+      })
+    })
+  })
+  
+  output$download_summary_report <- downloadHandler(
+    filename = function() { "Regression_Model_Summary.txt" },
+    content = function(file) {
+      req(data_rv$report_results)
+      writeLines(data_rv$report_results$summary, file)
+    }
+  )
+  
+  # --- Validation Loop Logic ---
+  shiny::observeEvent(input$run_validation_loop, {
+    req(data_rv$numeric, input$loop_iterations)
+    
+    withProgress(message = 'Running Validation Loop', value = 0, {
+      
+      req(data_rv$pub_results$model,
+          message = "Please run the Publication Analysis first to define a model for validation.")
+      
+      data <- data_rv$pub_results$final_data
+      model_formula <- formula(data_rv$pub_results$model)
+      
+      results <- NULL
+      for (i in 1:input$loop_iterations) {
+        incProgress(1/input$loop_iterations, detail = paste("Iteration", i))
+        set.seed(i)
+        testid <- sample(seq_len(nrow(data)), size = input$loop_test_size)
+        
+        trainingset <- data[-testid,]
+        testset <- data[testid,]
+        
+        tryCatch({
+          mdl <- lm(model_formula, data = trainingset)
+          predict <- predict(mdl, newdata = testset)
+          fitted <- mdl$fitted.values
+          
+          a <- eval_results(testset[[1]], predict, testset)
+          b <- eval_results(trainingset[[1]], fitted, trainingset)
+          
+          results <- rbind(results, data.frame(test.Rsquare = a$Rsquare, train.Rsquare = b$Rsquare))
+        }, error = function(e) {
+          # Skip iteration if model fails
+        })
+      }
+      
+      data_rv$loop_results <- results
+      
+      output$loop_test_r2_plot <- renderPlot({
+        req(data_rv$loop_results)
+        res <- data_rv$loop_results
+        avg <- mean(res$test.Rsquare, na.rm = TRUE)
+        
+        ggplot(res, aes(x = test.Rsquare)) +
+          geom_histogram(bins=20, fill="lightblue", color="black") +
+          geom_vline(xintercept = avg, color="red", linetype="dashed", size=1.5) +
+          labs(title = "Test Set R-squared Distribution",
+               subtitle = paste("Mean =", round(avg, 3), " | SD =", round(sd(res$test.Rsquare, na.rm=TRUE), 3)),
+               x = "R-squared", y = "Frequency") +
+          theme_publication()
+      })
+      
+      output$loop_train_r2_plot <- renderPlot({
+        req(data_rv$loop_results)
+        res <- data_rv$loop_results
+        avg <- mean(res$train.Rsquare, na.rm = TRUE)
+        
+        ggplot(res, aes(x = train.Rsquare)) +
+          geom_histogram(bins=20, fill="lightgreen", color="black") +
+          geom_vline(xintercept = avg, color="red", linetype="dashed", size=1.5) +
+          labs(title = "Train Set R-squared Distribution",
+               subtitle = paste("Mean =", round(avg, 3), " | SD =", round(sd(res$train.Rsquare, na.rm=TRUE), 3)),
+               x = "R-squared", y = "Frequency") +
+          theme_publication()
+      })
+      
+      output$loop_summary <- renderPrint({
+        req(data_rv$loop_results)
+        summary(data_rv$loop_results)
+      })
+      
+      output$loop_discussion_ui <- renderUI({
+        req(data_rv$loop_results)
+        wellPanel(
+          h4("Discussion of Results"),
+          generate_loop_discussion(data_rv$loop_results)
+        )
+      })
+    })
+  })
+  
+  # --- [IMPROVED] Model Comparison Logic ---
+  shiny::observeEvent(input$run_model_comparison, {
+    req(data_rv$processed, input$mc_response_var, input$mc_models_to_run)
+    
+    withProgress(message = 'Running Model Comparison', value = 0, {
+      
+      data <- data_rv$processed
+      response_var_name <- input$mc_response_var
+      data <- data %>% relocate(all_of(response_var_name), .before = 1)
+      
+      log <- c("--- Starting Model Comparison ---")
+      
+      # Kennard-Stone Split
+      incProgress(0.1, detail = "Splitting data...")
+      xspace <- data[,-1]
+      ks <- kenStone(as.matrix(xspace), k = input$mc_train_size, metric = "mahal", pc = 0.99)
+      train_idx <- ks$model
+      test_idx <- ks$test
+      
+      trainingset <- data[train_idx, ]
+      testset <- data[-train_idx, ]
+      
+      x_train <- as.matrix(trainingset[,-1]); y_train <- trainingset[[1]]
+      x_test <- as.matrix(testset[,-1]); y_test <- testset[[1]]
+      
+      log <- c(log, paste("Data split using Kennard-Stone:", nrow(trainingset), "training,", nrow(testset), "test samples."))
+      
+      all_results <- data.frame()
+      
+      models_to_run <- input$mc_models_to_run
+      n_models <- length(models_to_run)
+      
+      for (i in seq_along(models_to_run)) {
+        model_name <- models_to_run[i]
+        incProgress(1/n_models, detail = paste("Training", model_name, "..."))
+        log <- c(log, paste("\n--- Training", model_name, "---"))
+        
+        tryCatch({
+          # Train models based on selection
+          if (model_name == "Linear Regression") {
+            model <- lm(as.formula(paste(response_var_name, "~ .")), data = trainingset)
+            preds <- predict(model, testset); fits <- fitted(model)
+          } else if (model_name == "LASSO") {
+            model <- cv.glmnet(x_train, y_train, alpha = 1)
+            preds <- predict(model, x_test, s = "lambda.min"); fits <- predict(model, x_train, s = "lambda.min")
+            log <- c(log, "LASSO Coefficients:", capture.output(print(coef(model, s = "lambda.min"))))
+          } else if (model_name == "Ridge") {
+            model <- cv.glmnet(x_train, y_train, alpha = 0)
+            preds <- predict(model, x_test, s = "lambda.min"); fits <- predict(model, x_train, s = "lambda.min")
+            log <- c(log, "Ridge Coefficients:", capture.output(print(coef(model, s = "lambda.min"))))
+          } else if (model_name == "Elastic Net") {
+            model <- cv.glmnet(x_train, y_train, alpha = 0.5)
+            preds <- predict(model, x_test, s = "lambda.min"); fits <- predict(model, x_train, s = "lambda.min")
+          } else if (model_name == "Random Forest") {
+            model <- randomForest(x_train, y_train, ntree = 500)
+            preds <- predict(model, x_test); fits <- predict(model, x_train)
+          } else if (model_name == "SVM") {
+            model <- svm(x_train, y_train)
+            preds <- predict(model, x_test); fits <- predict(model, x_train)
+          } else if (model_name == "GBM") {
+            model <- gbm(as.formula(paste(response_var_name, "~ .")), data = trainingset, distribution = "gaussian", n.trees = 500, interaction.depth = 5, shrinkage = 0.01, cv.folds = 3, verbose = FALSE)
+            preds <- predict(model, testset, n.trees = 500); fits <- predict(model, trainingset, n.trees = 500)
+          } else if (model_name == "Stepwise Regression") {
+            mdl_null <- lm(as.formula(paste(response_var_name, "~ 1")), data = trainingset)
+            mdl_full <- lm(as.formula(paste(response_var_name, "~ .")), data = trainingset)
+            model <- step(mdl_null, scope = formula(mdl_full), direction = "both", trace = 0)
+            preds <- predict(model, newdata = testset); fits <- model$fitted.values
+            log <- c(log, "Stepwise Model Summary:", capture.output(summary(model)))
+          }
+          
+          test_res <- eval_results(y_test, preds, testset)
+          train_res <- eval_results(y_train, fits, trainingset)
+          
+          all_results <- rbind(all_results, data.frame(Model = model_name, Train_R2 = train_res$Rsquare, Test_R2 = test_res$Rsquare, Train_RMSE = train_res$RMSE, Test_RMSE = test_res$RMSE))
+          log <- c(log, "Training and evaluation successful.")
+          
+        }, error = function(e) {
+          log <- c(log, paste("ERROR training", model_name, ":", e$message))
+          # Add a row with NA for failed models to keep track
+          all_results <- rbind(all_results, data.frame(Model = model_name, Train_R2 = NA, Test_R2 = NA, Train_RMSE = NA, Test_RMSE = NA))
+        })
+      }
+      
+      data_rv$mc_results <- all_results
+      output$mc_log <- renderPrint({ cat(paste(log, collapse = "\n")) })
+      
+      output$mc_discussion_ui <- renderUI({
+        req(data_rv$mc_results)
+        wellPanel(
+          h4("Discussion of Results"),
+          generate_mc_discussion(data_rv$mc_results)
+        )
+      })
+    })
+  })
+  
+  output$mc_results_table <- renderDT({
+    req(data_rv$mc_results)
+    datatable(data_rv$mc_results %>% mutate(across(where(is.numeric), round, 4)), options = list(pageLength = 10))
+  })
+  
+  # --- [IMPROVED] Model Comparison Plot ---
+  output$mc_results_plot <- renderPlot({
+    req(data_rv$mc_results)
+    
+    # Reshape data for ggplot
+    plot_data <- data_rv$mc_results %>%
+      select(Model, Train_R2, Test_R2) %>%
+      pivot_longer(cols = c(Train_R2, Test_R2), names_to = "Set", values_to = "R_squared") %>%
+      mutate(Set = gsub("_R2", "", Set)) # Clean up names for legend
+    
+    ggplot(plot_data, aes(x = R_squared, y = reorder(Model, R_squared), fill = Set)) +
+      geom_col(position = "dodge", alpha=0.8) +
+      geom_text(aes(label = round(R_squared, 3)),
+                position = position_dodge(width=0.9),
+                hjust = -0.2, size = 4) +
+      scale_fill_manual(values = c("Train" = "#1f77b4", "Test" = "#ff7f0e"), name = "Data Set") +
+      scale_x_continuous(limits = c(0, max(plot_data$R_squared, na.rm = TRUE) * 1.1)) +
+      theme_publication(base_size = 16) +
+      labs(
+        title = "Model Performance Comparison",
+        subtitle = "Comparing R-squared on Training and Test Sets",
+        x = "R-squared (R²)",
+        y = "Model"
+      ) +
+      theme(legend.position = "top")
+  })
+  
+  
+  output$download_mc_results <- downloadHandler(
+    filename = function() { "model_comparison_results.csv" },
+    content = function(file) {
+      req(data_rv$mc_results)
+      write.csv(data_rv$mc_results, file, row.names = FALSE)
+    }
+  )
+  
+  # --- QSAR Analysis Logic ---
+  shiny::observeEvent(input$train_model, {
+    req(data_rv$processed, input$activity_var)
+    
+    y_data <- data_rv$processed[[input$activity_var]]
+    x_data <- data_rv$processed %>% select(-all_of(input$activity_var))
+    
+    split_ratio <- (100 - input$test_split_ratio) / 100
+    if (input$split_method == "Kennard-Stone") {
+      ks_split <- prospectr::kenStone(X = x_data, k = round(nrow(x_data) * split_ratio), metric = "euclid")
+      train_idx <- ks_split$model
+      test_idx <- ks_split$test
+    } else {
+      train_idx <- sample(1:nrow(x_data), size = round(nrow(x_data) * split_ratio))
+      test_idx <- setdiff(1:nrow(x_data), train_idx)
+    }
+    
+    x_train <- x_data[train_idx, ]; y_train <- y_data[train_idx]
+    x_test <- x_data[test_idx, ]; y_test <- y_data[test_idx]
+    
+    x_train_scaled <- scale(x_train); y_train_scaled <- scale(y_train)
+    
+    train_x_mean <- attr(x_train_scaled, "scaled:center"); train_x_std <- attr(x_train_scaled, "scaled:scale")
+    train_y_mean <- attr(y_train_scaled, "scaled:center"); train_y_std <- attr(y_train_scaled, "scaled:scale")
+    
+    model_fit <- NULL
+    if (input$model_method == "PLS") {
+      ncomp <- min(5, ncol(x_train_scaled))
+      model_fit <- plsr(y_train_scaled ~ x_train_scaled, ncomp = ncomp)
+    } else if (input$model_method == "Lasso") {
+      cv_lasso <- cv.glmnet(as.matrix(x_train_scaled), y_train_scaled, alpha = 1)
+      model_fit <- glmnet(as.matrix(x_train_scaled), y_train_scaled, alpha = 1, lambda = cv_lasso$lambda.min)
+    } else if (input$model_method == "Random Forest") {
+      model_fit <- randomForest(x = x_train, y = y_train, ntree = 500)
+    } else if (input$model_method == "SVM") {
+      model_fit <- svm(x = x_train, y = y_train)
+    } else if (input$model_method == "GBM") {
+      train_df <- as.data.frame(x_train)
+      train_df$Response <- y_train
+      model_fit <- gbm(Response ~ ., data = train_df, distribution = "gaussian", n.trees = 500, interaction.depth = 5, shrinkage = 0.01, cv.folds = 3, verbose = FALSE)
+    }
+    
+    data_rv$qsar_model <- list(
+      fit = model_fit, method = input$model_method,
+      scaling = list(x_mean = train_x_mean, x_std = train_x_std, y_mean = train_y_mean, y_std = train_y_std),
+      data = list(x_train = x_train, y_train = y_train, x_test = x_test, y_test = y_test)
+    )
+    
+    y_pred_train <- predict_qsar(data_rv$qsar_model, x_train)
+    r2 <- cor(y_train, y_pred_train, use="complete.obs")^2
+    rmse <- sqrt(mean((y_train - y_pred_train)^2, na.rm=TRUE))
+    
+    output$train_metrics <- renderPrint({
+      cat(paste("R-squared (R²):", round(r2, 4), "\n")); cat(paste("RMSE:", round(rmse, 4)))
+    })
+    
+    update_qsar_outputs()
+    
+    shinyjs::enable("validate_model"); shinyjs::disable("split_method")
+    shinyjs::disable("test_split_ratio"); shinyjs::disable("model_method")
+  })
+  
+  shiny::observeEvent(input$validate_model, {
+    req(data_rv$qsar_model)
+    
+    y_test <- data_rv$qsar_model$data$y_test; x_test <- data_rv$qsar_model$data$x_test
+    y_train <- data_rv$qsar_model$data$y_train
+    y_pred_test <- predict_qsar(data_rv$qsar_model, x_test)
+    
+    q2 <- 1 - (sum((y_test - y_pred_test)^2, na.rm=TRUE) / sum((y_test - mean(y_train, na.rm=TRUE))^2, na.rm=TRUE))
+    rmsep <- sqrt(mean((y_test - y_pred_test)^2, na.rm=TRUE))
+    
+    output$validation_metrics <- renderPrint({
+      cat(paste("Predictive R² (Q²):", round(q2, 4), "\n")); cat(paste("RMSEP:", round(rmsep, 4)))
+    })
+    
+    update_qsar_outputs(validated = TRUE)
+  })
+  
+  shiny::observeEvent(input$reset_qsar, {
+    data_rv$qsar_model <- NULL
+    output$train_metrics <- renderPrint({ cat("N/A") }); output$validation_metrics <- renderPrint({ cat("N/A") })
+    output$model_equation <- renderPrint({ cat("N/A") }); output$pred_vs_actual_plot <- renderPlotly({ NULL })
+    output$coeffs_plot <- renderPlotly({ NULL })
+    
+    shinyjs::enable("split_method"); shinyjs::enable("test_split_ratio")
+    shinyjs::enable("model_method"); shinyjs::disable("validate_model")
+  })
+  
+  predict_qsar <- function(model_list, new_x) {
+    if (model_list$method %in% c("PLS", "Lasso")) {
+      x_scaled <- scale(new_x, center = model_list$scaling$x_mean, scale = model_list$scaling$x_std)
+      pred_scaled <- if (model_list$method == "PLS") {
+        predict(model_list$fit, ncomp = model_list$fit$ncomp, newdata = x_scaled)[,,1]
+      } else { predict(model_list$fit, newx = as.matrix(x_scaled)) }
+      return(as.numeric(pred_scaled * model_list$scaling$y_std + model_list$scaling$y_mean))
+    } else if (model_list$method == "GBM") {
+      return(predict(model_list$fit, newdata = as.data.frame(new_x), n.trees = 500))
+    } else { # RF, SVM
+      return(predict(model_list$fit, newdata = new_x))
+    }
+  }
+  
+  update_qsar_outputs <- function(validated = FALSE) {
+    req(data_rv$qsar_model)
+    
+    output$model_equation <- renderPrint({
+      model <- data_rv$qsar_model
+      if (model$method == "PLS") {
+        coeffs <- coef(model$fit, ncomp = model$fit$ncomp, intercept = TRUE)
+        cat("Equation display is complex; showing top coefficients instead.\n")
+      } else if (model$method == "Lasso") {
+        coeffs <- as.matrix(coef(model$fit))
+        cat("Equation display is complex; showing top coefficients instead.\n")
+      } else {
+        cat("Model summary or variable importance is shown in the 'Coefficients/Importance' tab.")
+      }
+    })
+    
+    output$coeffs_plot <- renderPlotly({
+      model <- data_rv$qsar_model
+      if (model$method %in% c("PLS", "Lasso")) {
+        coeffs <- if (model$method == "PLS") {
+          coef(model$fit, ncomp = model$fit$ncomp)[,1,1]
+        } else { as.matrix(coef(model$fit))[-1,1] }
+        
+        coef_df <- data.frame(descriptor = names(coeffs), coefficient = coeffs) %>%
+          filter(coefficient != 0) %>% arrange(desc(abs(coefficient)))
+        
+        p <- ggplot(coef_df, aes(x = reorder(descriptor, coefficient), y = coefficient)) +
+          geom_bar(stat = "identity") + coord_flip() +
+          labs(title = "Model Coefficients", x = "Descriptor", y = "Coefficient Value") + theme_publication()
+        ggplotly(p)
+      } else if (model$method == "Random Forest") {
+        imp <- as.data.frame(importance(model$fit))
+        imp$descriptor <- rownames(imp)
+        p <- ggplot(imp, aes(x=reorder(descriptor, IncNodePurity), y=IncNodePurity)) +
+          geom_bar(stat="identity", fill="steelblue") +
+          coord_flip() +
+          labs(title="Variable Importance (Random Forest)", x="", y="IncNodePurity") +
+          theme_publication()
+        ggplotly(p)
+      } else {
+        # Placeholder for other models
+        p <- ggplot() + theme_void() + labs(title="Importance plot not available for this model type.")
+        ggplotly(p)
+      }
+    })
+    
+    output$pred_vs_actual_plot <- renderPlotly({
+      y_train <- data_rv$qsar_model$data$y_train
+      y_pred_train <- predict_qsar(data_rv$qsar_model, data_rv$qsar_model$data$x_train)
+      plot_df <- data.frame(actual = y_train, predicted = y_pred_train, set = "Training")
+      
+      if (validated) {
+        y_test <- data_rv$qsar_model$data$y_test
+        y_pred_test <- predict_qsar(data_rv$qsar_model, data_rv$qsar_model$data$x_test)
+        test_df <- data.frame(actual = y_test, predicted = y_pred_test, set = "Test")
+        plot_df <- rbind(plot_df, test_df)
+      }
+      
+      lims <- range(c(plot_df$actual, plot_df$predicted), na.rm=TRUE)
+      
+      p <- ggplot(plot_df, aes(x = actual, y = predicted, color = set, shape = set)) +
+        geom_point(size = 2.5, alpha = 0.8) +
+        geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+        coord_fixed(ratio = 1, xlim = lims, ylim = lims) +
+        theme_publication() + labs(title = "Predicted vs. Actual Activity", x = "Actual", y = "Predicted")
+      ggplotly(p)
+    })
+  }
+  
+  # --- [NEW] Final Report Logic ---
+  shiny::observeEvent(input$generate_final_report, {
+    
+    report <- c("======= COMPREHENSIVE ANALYSIS REPORT =======")
+    
+    # Publication Analysis Summary
+    if (!is.null(data_rv$pub_results)) {
+      report <- c(report, "\n\n--- PUBLICATION ANALYSIS SUMMARY ---")
+      report <- c(report, paste("Final Model Equation:", data_rv$pub_results$equation))
+      report <- c(report, "\nPerformance Metrics:")
+      report <- c(report, capture.output(print(data_rv$pub_results$performance)))
+      report <- c(report, "\nDiagnostics:")
+      report <- c(report, paste("Shapiro-Wilk (Normality of Residuals) p-value:", round(data_rv$pub_results$diagnostics$shapiro$p.value, 4)))
+      report <- c(report, paste("Breusch-Pagan (Homoscedasticity) p-value:", round(data_rv$pub_results$diagnostics$bptest$p.value, 4)))
+    }
+    
+    # Model Comparison Summary
+    if (!is.null(data_rv$mc_results)) {
+      report <- c(report, "\n\n--- MODEL COMPARISON SUMMARY ---")
+      best_model <- data_rv$mc_results %>% filter(Test_R2 == max(Test_R2, na.rm=TRUE))
+      report <- c(report, paste("Best performing model on test set:", best_model$Model, "(Test R² =", round(best_model$Test_R2, 3), ")"))
+      report <- c(report, "\nFull Comparison Table:")
+      report <- c(report, capture.output(print(data_rv$mc_results)))
+    }
+    
+    # Advanced Validation Summaries
+    if (!is.null(data_rv$ad_results)) {
+      report <- c(report, "\n\n--- APPLICABILITY DOMAIN SUMMARY ---")
+      outliers <- sum(data_rv$ad_results$plot_df$Status == "Outlier")
+      high_leverage <- sum(data_rv$ad_results$plot_df$Status == "High Leverage")
+      report <- c(report, paste("Number of outliers (poorly predicted):", outliers))
+      report <- c(report, paste("Number of high leverage compounds (extrapolations):", high_leverage))
+    }
+    
+    if (!is.null(data_rv$ys_results)) {
+      report <- c(report, "\n\n--- Y-SCRAMBLING SUMMARY ---")
+      report <- c(report, paste("Original Model R²:", round(data_rv$ys_results$original_r2, 3)))
+      report <- c(report, paste("Mean Scrambled Model R²:", round(mean(data_rv$ys_results$scrambled_r2), 3)))
+    }
+    
+    data_rv$final_report_text <- paste(report, collapse = "\n")
+    
+    output$final_report_output <- renderPrint({
+      cat(data_rv$final_report_text)
+    })
+  })
+  
+  output$download_final_report <- downloadHandler(
+    filename = function() { "Comprehensive_Analysis_Report.txt" },
+    content = function(file) {
+      req(data_rv$final_report_text)
+      writeLines(data_rv$final_report_text, file)
+    }
+  )
+  
+}
+
+# --- 4. Run the Application ---
+shinyApp(ui = ui, server = server)
