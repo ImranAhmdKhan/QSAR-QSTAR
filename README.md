@@ -1,0 +1,22 @@
+# Comprehensive Statistical Analysis and QSAR Modeling App in R Shiny
+#
+# This application provides a full suite of tools for data analysis, including:
+# 1. Data loading and exploration with automated guidance based on dataset size.
+# 2. Data preprocessing (imputation, transformation).
+# 3. Descriptive statistics and correlation analysis.
+# 4. Dimensionality reduction (PCA) and clustering (K-Means, Hierarchical).
+# 5. Automated feature selection for Multiple Linear Regression (MLR).
+# 6. Hyperparameter tuning for advanced models.
+# 7. A publication-focused analysis module with advanced diagnostics and reporting.
+# 8. A dedicated module for XGBoost (Extreme Gradient Boosting).
+# 9. Advanced validation including Applicability Domain (Williams Plot) and Y-Scrambling.
+# 10. A consolidated Analysis Dashboard for viewing all key plots together.
+# 11. Automated report generation.
+#
+# --- V16 ENHANCEMENTS ---
+# - Upgraded PCA plots to a more professional, publication-ready style based on user example.
+# - Improvised the Scree Plot to be more informative, showing both individual and
+#   cumulative variance explained using ggplot2.
+# - Added centered axes and a fixed aspect ratio to the PCA Scores Plot.
+# - Complete UI overhaul for a more professional and modern interface.
+
